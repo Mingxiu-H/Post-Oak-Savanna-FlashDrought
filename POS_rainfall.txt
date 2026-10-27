@@ -1,0 +1,189 @@
+// ============================================================
+// HYDROCLIMATIC COMPARISON: 2007 vs. 2011
+// GridMET daily precipitation — POS regional mean
+//
+// Dry day: precipitation < 1 mm/day
+// Growing season: April 1 – September 30
+// ============================================================
+
+// Existing study region:
+// var POS = ee.FeatureCollection(...);
+var POS = ee.FeatureCollection("projects/top-script-319218/assets/POS");
+
+var prGridMET = ee.ImageCollection('IDAHO_EPSCOR/GRIDMET')
+  .select('pr');
+
+var studyYears = ee.List([2007, 2011]);
+
+var DRY_THRESHOLD = 1;   // mm/day
+var MIN_DRY_SPELL = 5;   // days
+
+// ------------------------------------------------------------
+// 1. Convert daily precipitation images to regional mean
+// ------------------------------------------------------------
+
+function dailyPrecipitation(year) {
+
+  year = ee.Number(year);
+
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+
+  var daily = prGridMET
+    .filterDate(start, end)
+    .map(function(img) {
+
+      var stats = img.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: POS.geometry(),
+        scale: 4638,
+        maxPixels: 1e13,
+        tileScale: 4
+      });
+
+      return ee.Feature(null, {
+        'date': img.date().format('YYYY-MM-dd'),
+        'month': img.date().get('month'),
+        'precip_mm': stats.get('pr')
+      });
+    });
+
+  return ee.FeatureCollection(daily)
+    .sort('date');
+}
+
+
+// ------------------------------------------------------------
+// 2. Calculate dry-spell statistics
+// ------------------------------------------------------------
+
+function drySpellStatistics(dailyFC) {
+
+  var dailyList = dailyFC.toList(dailyFC.size());
+
+  var initial = ee.Dictionary({
+    currentLength: 0,
+    maxLength: 0,
+    spellCount: 0
+  });
+
+  var result = ee.Dictionary(dailyList.iterate(
+    function(feature, state) {
+
+      feature = ee.Feature(feature);
+      state = ee.Dictionary(state);
+
+      var precip = ee.Number(feature.get('precip_mm'));
+
+      var isDry = precip.lt(DRY_THRESHOLD);
+
+      var previousLength =
+        ee.Number(state.get('currentLength'));
+
+      var newLength = ee.Number(
+        ee.Algorithms.If(
+          isDry,
+          previousLength.add(1),
+          0
+        )
+      );
+
+      // Count completed dry spells lasting >= 5 days
+      var completedSpell = previousLength.gte(MIN_DRY_SPELL)
+        .and(isDry.not());
+
+      var newCount = ee.Number(state.get('spellCount'))
+        .add(ee.Number(completedSpell));
+
+      var newMax = ee.Number(state.get('maxLength'))
+        .max(newLength);
+
+      return ee.Dictionary({
+        currentLength: newLength,
+        maxLength: newMax,
+        spellCount: newCount
+      });
+
+    },
+    initial
+  ));
+
+  // Include a dry spell extending to September 30
+  var finalLength = ee.Number(result.get('currentLength'));
+
+  var totalSpells = ee.Number(result.get('spellCount'))
+    .add(ee.Number(finalLength.gte(MIN_DRY_SPELL)));
+
+  return ee.Dictionary({
+    max_dry_spell_days: result.get('maxLength'),
+    number_dry_spells_5days: totalSpells
+  });
+}
+
+
+// ------------------------------------------------------------
+// 3. Annual and growing-season statistics
+// ------------------------------------------------------------
+
+var hydroSummary = ee.FeatureCollection(
+  studyYears.map(function(year) {
+
+    year = ee.Number(year);
+
+    var daily = dailyPrecipitation(year);
+
+    // April through September
+    // var growingSeason = daily.filter(
+    //   ee.Filter.calendarRange(4, 9, 'month')
+    // );
+    var growingSeason = daily.filter(
+      ee.Filter.gte('month', 4)
+    ).filter(
+      ee.Filter.lte('month', 9)
+    );
+
+    var annualPrecip = ee.Number(
+      daily.aggregate_sum('precip_mm')
+    );
+
+    var growingPrecip = ee.Number(
+      growingSeason.aggregate_sum('precip_mm')
+    );
+
+    var dryStats = drySpellStatistics(growingSeason);
+
+    return ee.Feature(null, {
+      year: year,
+      annual_precip_mm: annualPrecip,
+      growing_season_precip_mm: growingPrecip,
+      max_dry_spell_days:
+        dryStats.get('max_dry_spell_days'),
+      number_dry_spells_5days:
+        dryStats.get('number_dry_spells_5days')
+    });
+
+  })
+);
+
+
+// ------------------------------------------------------------
+// 4. View and export results
+// ------------------------------------------------------------
+
+print('2007 vs 2011 hydroclimatic comparison',
+      hydroSummary);
+
+// Export.table.toDrive({
+//   collection: hydroSummary,
+//   description: 'POS_2007_2011_Hydroclimatic_Comparison',
+//   folder: 'GEE_Exports',
+//   fileNamePrefix: 'POS_2007_2011_Hydroclimatic_Comparison',
+//   fileFormat: 'CSV',
+//   selectors: [
+//     'year',
+//     'annual_precip_mm',
+//     'growing_season_precip_mm',
+//     'max_dry_spell_days',
+//     'number_dry_spells_5days'
+//   ]
+// });

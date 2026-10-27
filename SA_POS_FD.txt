@@ -1,0 +1,3772 @@
+// white background
+var baseChange = [{featureType: 'all', stylers: [{color: '#FFFFFF'}] }];
+Map.setOptions('baseChange', {'baseChange': baseChange}); 
+
+// Load your FeatureCollection
+var POS = ee.FeatureCollection("projects/top-script-319218/assets/POS");
+// var POS = ee.FeatureCollection("projects/top-script-319218/assets/POS_Subregions_Export");
+
+// Load MODIS AET / PET data
+var et = ee.ImageCollection("MODIS/061/MOD16A2GF")
+            .select(['ET','PET'])
+            .filterDate('2000-01-01', '2024-12-31')
+            .filterBounds(POS);
+
+// Compute ESR = ET / PET for each grid cell
+//Convert from kg m⁻² per 8 days → mm per 8 days 
+//(multiply by 0.1 if needed—MODIS stores ET × 0.1 mm).
+var esr = et.map(function(img){
+  var et_mm  = img.select('ET').multiply(0.1);
+  var pet_mm = img.select('PET').multiply(0.1);
+  return et_mm.divide(pet_mm)
+              .updateMask(pet_mm.gt(0))
+              .rename('ESR')
+              .copyProperties(img, ['system:time_start']);
+});
+
+// 8-day SESR standardization (per bin across all years)
+
+var STEP_DAYS = 8;
+var NBINS     = 46; // ~365/8
+var bins = ee.List.sequence(0, NBINS - 1);
+
+// Tag each ESR image with its 8-day-of-year bin (0..45)
+function addBin(img){
+  var t   = ee.Date(img.get('system:time_start'));
+  var y0  = ee.Date.fromYMD(t.get('year'), 1, 1);
+  var doy = t.difference(y0, 'day');              // 0..364/365
+  var bin = doy.divide(STEP_DAYS).floor().int();  // 0..45
+  return img.set('bin', bin);
+}
+
+// Tag bins directly on un-clipped ESR
+var esr_b = esr.map(addBin);
+
+// use the precomputed ESR climatology
+// Put the exact asset path you see in the Assets panel:
+var baseProj = et.first().select('ET').projection();
+var CLIM = ee.Image('users/mingxiuw/POS_ESR_climatology_bins_2024')
+  .setDefaultProjection(baseProj);
+
+
+// SESR(t) = (ESR - mean_bin) / std_bin using stored climatology
+// For each image at bin p:
+var sesr = esr_b.map(function(img){
+  var bstr = ee.Number(img.get('bin')).format('%02d');  // '00'..'45'
+  var meanName = ee.String('mean_bin_').cat(bstr);
+  var stdName  = ee.String('std_bin_').cat(bstr);
+
+  var mu  = CLIM.select(meanName);
+  var sig = CLIM.select(stdName);
+
+  return img.subtract(mu).divide(sig)
+           .updateMask(sig.gt(0))
+           .rename('SESR')
+           .copyProperties(img, ['system:time_start'])
+           .set('bin', img.get('bin'));
+});
+
+
+// ΔSESR: SESR(t) − SESR(t−1) (pre-Eq. 3)
+// ΔSESR and its standardized form S(ΔSESR)
+// 1. Sort SESR in time (important before differencing)
+var sesrSorted = sesr.sort('system:time_start');
+// Build list for index-based access
+var sesrList = sesrSorted.toList(sesrSorted.size());
+
+// 2. Compute ΔSESR = SESR(t) − SESR(t−1), within-year
+// var dsesr = ee.ImageCollection(
+//   ee.List.sequence(1, sesrList.size().subtract(1)).map(function(i) {
+//     i = ee.Number(i);
+//     var curr = ee.Image(sesrList.get(i));
+//     var prev = ee.Image(sesrList.get(i.subtract(1)));
+
+//     // Only use differences within the same year
+//     var tCurr = ee.Date(curr.get('system:time_start'));
+//     var tPrev = ee.Date(prev.get('system:time_start'));
+//     var sameYear = tCurr.get('year').eq(tPrev.get('year'));
+
+//     var diff = curr.subtract(prev)
+//                   .updateMask(sameYear)   // mask cross-year transitions
+//                   .rename('dSESR')
+//                   .copyProperties(curr, curr.propertyNames());
+
+//     return diff;
+//   })
+// );
+
+// 2. Compute ΔSESR = SESR(t) − SESR(t−1), allowing cross-year differences
+var dsesr = ee.ImageCollection(
+  ee.List.sequence(1, sesrList.size().subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var curr = ee.Image(sesrList.get(i));
+    var prev = ee.Image(sesrList.get(i.subtract(1)));
+
+    var diff = curr.subtract(prev)
+                   .rename('dSESR')
+                   .copyProperties(curr, curr.propertyNames());
+
+    return diff;
+  })
+);
+
+
+// 3. Bin-based ΔSESR climatology: mean and std per bin
+var dMeanIC = ee.ImageCollection(
+  bins.map(function(b){
+    b = ee.Number(b);
+    var coll = dsesr.filter(ee.Filter.eq('bin', b));
+    return coll.mean().rename('tmp');
+  })
+).toBands();
+
+var dMeanNames = bins.map(function(b){
+  return ee.String('dmean_').cat(ee.Number(b).format('%02d'));
+});
+var dsesrMean = dMeanIC.rename(dMeanNames);
+
+var dStdIC = ee.ImageCollection(
+  bins.map(function(b){
+    b = ee.Number(b);
+    var coll = dsesr.filter(ee.Filter.eq('bin', b));
+    return coll.reduce(ee.Reducer.stdDev()).rename('tmp');
+  })
+).toBands();
+
+var dStdNames = bins.map(function(b){
+  return ee.String('dstd_').cat(ee.Number(b).format('%02d'));
+});
+var dsesrStd = dStdIC.rename(dStdNames);
+
+// 4. Standardized ΔSESR (SdSESR) for each time step
+//    SdSESR = (dSESR - mean_bin) / std_bin
+//    For criterion 4, later we'll use mean(SdSESR) < -0.674
+var SdSESR = dsesr.map(function(img){
+  var bstr = ee.Number(img.get('bin')).format('%02d');
+
+  var meanName = ee.String('dmean_').cat(bstr);
+  var stdName  = ee.String('dstd_').cat(bstr);
+
+  var mu  = dsesrMean.select(meanName);
+  var sig = dsesrStd.select(stdName);
+
+  return img.subtract(mu)
+            .divide(sig)
+            .updateMask(sig.gt(0))
+            .rename('SdSESR')
+            .copyProperties(img, ['system:time_start', 'bin']);
+});
+
+// -----------------------------------------------------
+// SESR 20th percentile per bin  (Criterion 2)
+// -----------------------------------------------------
+var sesrP20IC = ee.ImageCollection(
+  bins.map(function(b){
+    b = ee.Number(b);
+    var coll = sesr.filter(ee.Filter.eq('bin', b));
+    return coll.reduce(ee.Reducer.percentile([20])).rename('tmp');
+  })
+).toBands();
+
+var sesrP20Names = bins.map(function(b){
+  return ee.String('sesrP20_').cat(ee.Number(b).format('%02d'));
+});
+var sesrP20bin = sesrP20IC.rename(sesrP20Names);
+
+// -----------------------------------------------------
+// dSESR 40th percentile per bin (Criterion 3a)
+// -----------------------------------------------------
+var dP40IC = ee.ImageCollection(
+  bins.map(function(b){
+    b = ee.Number(b);
+    var coll = dsesr.filter(ee.Filter.eq('bin', b));
+    return coll.reduce(ee.Reducer.percentile([40])).rename('tmp');
+  })
+).toBands();
+
+var dP40Names = bins.map(function(b){
+  return ee.String('dP40_').cat(ee.Number(b).format('%02d'));
+});
+var dsesrP40bin = dP40IC.rename(dP40Names);
+
+
+// SESR with "below 20th percentile" mask (Criterion 2)
+var sesrWithP20 = sesrSorted.map(function(img){
+  var bstr = ee.Number(img.get('bin')).format('%02d');
+  var p20Name = ee.String('sesrP20_').cat(bstr);
+  var p20  = sesrP20bin.select(p20Name);
+
+  return img.addBands(
+             img.lte(p20).rename('SESR_belowP20')
+           )
+           .copyProperties(img, img.propertyNames());
+});
+
+
+// dSESR with "≤ 40th percentile" mask (Criterion 3a)
+var dsesrWithP40 = dsesr.map(function(img){
+  var bstr = ee.Number(img.get('bin')).format('%02d');
+  var p40Name = ee.String('dP40_').cat(bstr);
+  var p40  = dsesrP40bin.select(p40Name);
+
+  return img.addBands(
+             img.lte(p40).rename('dSESR_rapid')
+           )
+           .copyProperties(img, img.propertyNames());
+});
+
+
+// =====================================================
+// Flash drought event detection (4×8-day bins ≈ 32 days)
+// Criteria: 1, 2, 3a+3b, 4 (SdSESR-based)
+// =====================================================
+
+// =====================================================
+// MEMORY-SAFE FLASH DROUGHT DETECTION
+// accumulate FD frequency directly as a single image
+// no ImageCollections, no flattening, no summing
+// =====================================================
+
+var sesrSorted  = sesrWithP20.sort('system:time_start');
+var dsesrSorted = dsesrWithP40.sort('system:time_start');
+var sdSorted    = SdSESR.sort('system:time_start');
+
+
+function dsesrPercentileByBin(p) {
+  var pIC = ee.ImageCollection(
+    bins.map(function(b){
+      b = ee.Number(b);
+      var coll = dsesr.filter(ee.Filter.eq('bin', b));
+      return coll.reduce(ee.Reducer.percentile([p])).rename('tmp');
+    })
+  ).toBands();
+
+  var names = bins.map(function(b){
+    return ee.String('dP').cat(ee.Number(p).format()).cat('_').cat(ee.Number(b).format('%02d'));
+  });
+
+  return pIC.rename(names);
+}
+
+// Threshold images (each has 46 bands: dPxx_00 ... dPxx_45)
+var dsesrP10bin = dsesrPercentileByBin(10);
+var dsesrP15bin = dsesrPercentileByBin(15);
+var dsesrP20bin = dsesrPercentileByBin(20);
+var dsesrP25bin = dsesrPercentileByBin(25);  // replaces/duplicates your existing one
+
+
+// ===============================================
+// Flash drought windows (full series, cross-year)
+// ===============================================
+var MIN_DSESR_LEN = 3;   // 4 dSESR steps => 4×8-day bins = 32 days
+
+var sesrSorted  = sesrWithP20.sort('system:time_start');
+var dsesrSorted = dsesrWithP40.sort('system:time_start');  // has bands: dSESR + dSESR_rapid
+
+var N  = sesrSorted.size();
+var Nd = dsesrSorted.size();   // ~ N - 1
+
+var sesrList = sesrSorted.toList(N);
+var dList    = dsesrSorted.toList(Nd);
+
+var kList = ee.List.sequence(MIN_DSESR_LEN, N.subtract(1));
+
+var fdWin3 = ee.ImageCollection(
+  kList.map(function(k){
+    k = ee.Number(k);
+
+    // Criterion 2: final SESR below 20th percentile (bin-based)
+    var sesrImg = ee.Image(sesrList.get(k));
+    var finalOK = sesrImg.select('SESR_belowP20');
+
+    // 4 dSESR steps ending at k: indices (k-4, k-3, k-2, k-1) in dList
+    var d0 = ee.Image(dList.get(k.subtract(3)));
+    var d1 = ee.Image(dList.get(k.subtract(2)));
+    var d2 = ee.Image(dList.get(k.subtract(1)));
+
+
+    // Criterion 3a+3b (your choice): ≥3 of 4 are “rapid”
+    var r0 = d0.select('dSESR_rapid');
+    var r1 = d1.select('dSESR_rapid');
+    var r2 = d2.select('dSESR_rapid');
+
+
+    var rapidSum = r0.add(r1).add(r2);
+    var rapidOK  = rapidSum.gte(2);
+
+    // ----------------------------
+    // Criterion 4 (STRICT): mean(dSESR over FD period)
+    // < 25th percentile climatological dSESR for that pixel & time-of-year(bin)
+    // ----------------------------
+    var meanD = d0.select('dSESR')
+                 .add(d1.select('dSESR'))
+                 .add(d2.select('dSESR'))
+                 .divide(3);
+
+    // per-step bin-based P25 thresholds (match each dSESR step’s bin)
+    var b0 = ee.Number(d0.get('bin')).format('%02d');
+    var b1 = ee.Number(d1.get('bin')).format('%02d');
+    var b2 = ee.Number(d2.get('bin')).format('%02d');
+
+
+    var t0 = dsesrP25bin.select(ee.String('dP25_').cat(b0));
+    var t1 = dsesrP25bin.select(ee.String('dP25_').cat(b1));
+    var t2 = dsesrP25bin.select(ee.String('dP25_').cat(b2));
+
+
+    var meanT = t0.add(t1).add(t2).divide(3);
+
+    var crit4OK = meanD.lt(meanT);
+
+    // final window mask
+    var fdMask = finalOK.and(rapidOK).and(crit4OK)
+                        .rename('FDwin3')
+                        .copyProperties(sesrImg, ['system:time_start']);
+
+    return fdMask;
+  })
+);
+
+// =====================================================
+// STEP 2 (Intensity): classify each qualifying FD window (FD1–FD4)
+// based on mean(dSESR) vs bin-based climatological percentiles
+// =====================================================
+
+var fdWinWithIntensity = ee.ImageCollection(
+  kList.map(function(k){
+    k = ee.Number(k);
+
+    // --- rebuild the same FD mask logic (must match fdWin3 exactly) ---
+    var sesrImg = ee.Image(sesrList.get(k));
+    var finalOK = sesrImg.select('SESR_belowP20');
+
+    var d0 = ee.Image(dList.get(k.subtract(3)));
+    var d1 = ee.Image(dList.get(k.subtract(2)));
+    var d2 = ee.Image(dList.get(k.subtract(1)));
+
+
+    var r0 = d0.select('dSESR_rapid');
+    var r1 = d1.select('dSESR_rapid');
+    var r2 = d2.select('dSESR_rapid');
+
+
+    var rapidSum = r0.add(r1).add(r2);
+    var rapidOK  = rapidSum.gte(2);
+
+    var meanD = d0.select('dSESR')
+      .add(d1.select('dSESR'))
+      .add(d2.select('dSESR'))
+      .divide(3);
+
+    var b0 = ee.Number(d0.get('bin')).format('%02d');
+    var b1 = ee.Number(d1.get('bin')).format('%02d');
+    var b2 = ee.Number(d2.get('bin')).format('%02d');
+
+
+    // P25 for Criterion 4 check (same as your fdWin3)
+    var t25 = dsesrP25bin.select(ee.String('dP25_').cat(b0))
+      .add(dsesrP25bin.select(ee.String('dP25_').cat(b1)))
+      .add(dsesrP25bin.select(ee.String('dP25_').cat(b2)))
+      .divide(3);
+
+    var crit4OK = meanD.lt(t25);
+
+    var fdMask = finalOK.and(rapidOK).and(crit4OK).rename('FDwin3');
+
+    // --- intensity thresholds (mean of P10/P15/P20/P25 across the 4 steps) ---
+    var t10 = dsesrP10bin.select(ee.String('dP10_').cat(b0))
+      .add(dsesrP10bin.select(ee.String('dP10_').cat(b1)))
+      .add(dsesrP10bin.select(ee.String('dP10_').cat(b2)))
+      .divide(3);
+
+    var t15 = dsesrP15bin.select(ee.String('dP15_').cat(b0))
+      .add(dsesrP15bin.select(ee.String('dP15_').cat(b1)))
+      .add(dsesrP15bin.select(ee.String('dP15_').cat(b2)))
+      .divide(3);
+
+    var t20 = dsesrP20bin.select(ee.String('dP20_').cat(b0))
+      .add(dsesrP20bin.select(ee.String('dP20_').cat(b1)))
+      .add(dsesrP20bin.select(ee.String('dP20_').cat(b2)))
+      .divide(3);
+
+    // FD categories:
+    // FD1: [P20, P25) ; FD2: [P15, P20) ; FD3: [P10, P15) ; FD4: < P10
+    var intensity = ee.Image(0)
+      .where(fdMask.and(meanD.lt(t25)).and(meanD.gte(t20)), 1)
+      .where(fdMask.and(meanD.lt(t20)).and(meanD.gte(t15)), 2)
+      .where(fdMask.and(meanD.lt(t15)).and(meanD.gte(t10)), 3)
+      .where(fdMask.and(meanD.lt(t10)), 4)
+      .rename('FD_intensity');
+
+    return fdMask
+      .addBands(meanD.rename('meanD'))
+      .addBands(intensity)
+      .copyProperties(sesrImg, ['system:time_start']);
+  })
+);
+
+
+// ===============================================
+// Merge contiguous windows into events (runs)
+// ===============================================
+
+// Make FD window masks byte so sums are cheap
+var fdWin3_byte = fdWin3.map(function(img){ return img.unmask(0).toByte(); });
+var totalWin    = fdWin3_byte.sum().rename('FD_windows_total');
+
+// Detect event starts: current == 1 and previous == 0
+var fdList = fdWin3_byte.toList(fdWin3_byte.size());
+var startsIC = ee.ImageCollection(
+  ee.List.sequence(0, fdWin3_byte.size().subtract(1)).map(function(i){
+    i = ee.Number(i);
+    var curr = ee.Image(fdList.get(i)); // byte
+    var prev = ee.Image(ee.Algorithms.If(
+      i.eq(0),
+      ee.Image(0).toByte().reproject(curr.projection()),
+      fdList.get(i.subtract(1))
+    ));
+    return curr.eq(1).and(prev.eq(0)).toByte().rename('FD_start');
+  })
+);
+
+// Number of distinct FD events per pixel (merged runs)
+var nEvents = startsIC.sum().rename('FD_events');
+
+// (optional) mean duration, frequency, etc. can be rebuilt like in old code
+// For now, if you only want count, export nEvents:
+var fdCount = nEvents;
+
+
+// Export full-resolution FD frequency image to assets
+// Export.image.toAsset({
+//   image: fdCount.setDefaultProjection(baseProj).clip(POS),
+//   description: 'POS_FD_count_2000_2024',
+//   assetId: 'users/mingxiuw/SA_POS_FD_count_2000_2024_v4',
+//   region: POS.geometry(),
+//   scale: 500,
+//   maxPixels: 1e13
+// });
+
+
+// Display
+var rdylbuRev = ['#313695','#4575b4','#74add1','#abd9e9','#e0f3f8',
+                '#ffffbf','#fee090','#fdae61','#f46d43','#d73027','#a50026'];
+var crameri = [
+  // '#324180', // Block 1 (Value: 0)  - Deep Ocean Blue
+  // '#5d9bba', // Block 2 (Value: 7)  - Muted Teal Blue
+  // '#dcad92', // Block 3 (Value: 13) - Warm Peach/Terracotta
+  // '#771706'  // Block 4 (Value: 20) - Deep Crimson Red
+  
+  // '#324180', // Block 1 (0)  - Deep Ocean Blue
+  // '#7faec6', // Block 2 (5)  - Muted Teal Blue
+  // '#ffffff', // Block 3 (10) - Pure White (Absolute Center)
+  // '#dfb39a', // Block 4 (15) - Warm Peach
+  // '#771706'  // Block 5 (20) - Deep Crimson Red
+  
+  // '#324180', // Block 1 (0)  - Deep Ocean Blue
+  '#ffffff', // 
+  '#e8c49e',
+  '#e88764', // 
+  '#942801' // 
+];
+// ── Crameri "lajolla" palette (11-stop, light → dark) ────────────────────
+var lajolla = [
+  '#FAEACB',  // 0  — pale cream
+  '#F5D49A',  // 1  — light yellow
+  '#F0BC6A',  // 2  — warm yellow-orange
+  '#E89B45',  // 3  — golden orange
+  '#DC7D2A',  // 4  — burnt orange
+  '#C96018',  // 5  — deep orange
+  '#B04410',  // 6  — orange-red
+  '#90300B',  // 7  — brick red
+  '#6E1E09',  // 8  — dark red-brown
+  '#4D1008',  // 9  — very dark brown
+  '#2B0505'   // 10 — near-black maroon
+];
+
+// ── Paul Tol "tol_rainbow" palette (11-stop) ─────────────────────────────
+// var tolRainbow = [
+//   '#882E72',  //  0 — purple
+//   '#1965B0',  //  1 — dark blue
+//   '#437DBF',  //  2 — medium blue
+//   '#7BAFDE',  //  3 — light blue
+//   '#4EB265',  //  4 — teal-green
+//   '#90C987',  //  5 — light green
+//   '#CAE0AB',  //  6 — pale yellow-green
+//   '#F7F056',  //  7 — yellow
+//   '#F4A736',  //  8 — orange
+//   '#E65518',  //  9 — deep orange-red
+//   '#DC050C'   // 10 — red
+// ];
+
+
+
+var FD_count = ee.Image('users/mingxiuw/SA_POS_FD_count_2000_2024_v4');
+
+print('FD_count min/max', FD_count.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500,
+  maxPixels: 1e13
+}));
+
+// Map.addLayer(FD_count,{min: 0,max: 27,palette: rdylbuRev},'FD Count (2000–2024)');
+Map.addLayer(FD_count,{min: 0,max: 27,palette: lajolla},'FD Count (2000–2024)');
+
+// addVerticalLegend('FD counts', lajolla, 0, 27,  'bottom-right');   // adjust max to your data
+// addSegmentedLegend(
+//   'FD counts',   // \n splits title onto two lines
+//   lajolla,
+//   0,                     // min
+//   27,                    // max
+//   'bottom-right',
+//   4                      // number of discrete colour blocks
+// );
+
+// // ===========================
+// // Flash drought FREQUENCY (%)
+// // ===========================
+
+// // List of years in your study period
+// var startYear = 2000;
+// var endYear   = 2024;
+// var yearList  = ee.List.sequence(startYear, endYear);
+// var totalYears = endYear - startYear + 1;  // 25 years
+
+// // Attach "year" property to each FD window (using its end date)
+// var fdWin3Y = fdWin3.map(function(img){
+//   var yr = ee.Date(img.get('system:time_start')).get('year');
+//   return img.set('year', yr);
+// });
+
+// // For each year: 1 where there is at least ONE FD window, else 0
+// var yearlyAny = ee.ImageCollection(
+//   yearList.map(function(yr){
+//     yr = ee.Number(yr);
+//     var yrIC = fdWin3Y.filter(ee.Filter.eq('year', yr));
+
+//     var any = ee.Image(ee.Algorithms.If(
+//       yrIC.size().gt(0),
+//       //yrIC.max(),                 // 1 where at least one FD window in that year
+//       yrIC.max().unmask(0)
+//       //ee.Image(0)                 // no windows → 0 everywhere
+//     )).rename('FD_any');
+
+//     return any.set('year', yr);
+//   })
+// );
+
+// // Number of years with ≥1 FD event
+// var nYearsWithFD = yearlyAny.sum().rename('FD_years_with_event');
+
+// // Convert to % frequency over the full period
+// var fdFreq = nYearsWithFD
+//               .divide(totalYears)
+//               .multiply(100)
+//               .rename('FD_frequency_pct');
+               
+
+// ===========================
+// Flash drought FREQUENCY (%)  (any FD window in that calendar year)
+// ===========================
+var startYear   = 2000;
+var endYear     = 2024;
+var yearList    = ee.List.sequence(startYear, endYear);
+var totalYears  = endYear - startYear + 1;
+
+// Force a consistent projection for all intermediate rasters
+var proj  = baseProj;   // your MODIS 500 m projection
+var scale = 500;
+
+// Attach year property to each FD window
+var fdWin3Y = fdWin3.map(function(img){
+  var yr = ee.Date(img.get('system:time_start')).get('year');
+  return img.unmask(0).toByte()   // IMPORTANT: remove mask holes in windows
+           .set('year', yr);
+});
+
+// For each year: 1 if any FD window exists that year, else 0 (full-coverage image)
+var yearlyAny = ee.ImageCollection.fromImages(
+  yearList.map(function(y){
+    y = ee.Number(y);
+    var yrIC = fdWin3Y.filter(ee.Filter.eq('year', y));
+
+    var any = ee.Image(ee.Algorithms.If(
+      yrIC.size().gt(0),
+      yrIC.max(),                           // already unmasked above
+      ee.Image(0).toByte().rename('FD_any') // no windows that year
+    )).rename('FD_any')
+      .setDefaultProjection(proj)
+      .reproject({crs: proj.crs(), scale: scale})
+      .unmask(0);                           // IMPORTANT: guarantee 0 everywhere
+
+    return any.set('year', y);
+  })
+);
+
+// Number of years with ≥1 FD window
+var nYearsWithFD = yearlyAny.sum()
+  .rename('FD_years_with_event')
+  .setDefaultProjection(proj)
+  .reproject({crs: proj.crs(), scale: scale})
+  .unmask(0);
+
+// Convert to % frequency over the full period
+var fdFreq = nYearsWithFD.divide(totalYears).multiply(100)
+  .rename('FD_frequency_pct')
+  .setDefaultProjection(proj)
+  .reproject({crs: proj.crs(), scale: scale})
+  .unmask(0);
+
+
+// Export.image.toAsset({
+//   image: fdFreq .setDefaultProjection(baseProj).clip(POS),
+//   description: 'POS_FD_frequencyPct_2000_2024',
+//   assetId: 'users/mingxiuw/SA_POS_FD_freqPct_2000_2024_v5', //v5: no value shows blue; v4: no value shows white
+//   region: POS.geometry(),
+//   scale: 500,
+//   maxPixels: 1e13
+// });
+
+// !! Add .unmask(0) -> removed masked holes and correctly treated missing pixels as 0.So the 84% value is more correct than 80%.
+
+// Display
+var FD_freq = ee.Image('users/mingxiuw/SA_POS_FD_freqPct_2000_2024_v5');
+var FD_freq_fixed = FD_freq.unmask(0);
+
+print('FD_freq min/max', FD_freq_fixed.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500,
+  maxPixels: 1e13
+}));
+
+Map.addLayer(FD_freq,{min: 0,max: 84,palette: lajolla},'FD frequency (% of 25 year)');
+// addVerticalLegend('FD Frequency (%)', lajolla, 0,84, 'bottom-right');
+// ── Segmented legend ──────────────────────────────────────────────────────
+// Last argument = number of segments (7 matches the reference figure style)
+// addSegmentedLegend(
+//   'FD frequency (%)',   // \n splits title onto two lines
+//   lajolla,
+//   0,                     // min
+//   84,                    // max
+//   'bottom-right',
+//   6                      // number of discrete colour blocks
+// );
+
+
+// ===============================================
+// Mean FD duration (days) per pixel over 2000–2024
+// ===============================================
+// duration (days) per event = (L + (MIN_DSESR_LEN - 1)) * 8
+var meanDurDays = totalWin.add(nEvents.multiply(MIN_DSESR_LEN - 1))
+                          .divide(nEvents)
+                          .multiply(8)
+                          .rename('FD_mean_duration_days')
+                          .updateMask(nEvents.gt(0));
+
+// Export.image.toAsset({
+//   image: meanDurDays.setDefaultProjection(baseProj).clip(POS),
+//   description: 'POS_FD_meanDurDays_2000_2024',
+//   assetId: 'users/mingxiuw/SA_POS_FD_meanDur_2000_2024_v4',
+//   region: POS.geometry(),
+//   scale: 500,
+//   maxPixels: 1e13
+// });
+
+
+var FD_dur = ee.Image('users/mingxiuw/SA_POS_FD_meanDur_2000_2024_v4');
+// var FD_dur_fixed = FD_dur.unmask(0);
+
+print('FD_dur min/max', FD_dur.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500,
+  maxPixels: 1e13
+}));
+
+Map.addLayer(FD_dur,{min: 24,max: 34,palette: lajolla},'FD duration (days)');
+// addVerticalLegend('FD duration (days)', lajolla, 32, 43, 'bottom-right');
+// addSegmentedLegend(
+//   'FD duration (days)',   // \n splits title onto two lines
+//   lajolla,
+//   32,                     // min
+//   43,                    // max
+//   'bottom-right',
+//   3                      // number of discrete colour blocks
+// );
+
+// =========================================================================
+// FOOLPROOF EXPORT: ELIMINATES BLACK CORNERS USING A WHITE BACKGROUND IMAGE
+/*
+// 1. Prepare your map image and clip it cleanly to the study region boundary
+var img = FD_dur.clip(POS);
+var vis = {min: 32, max: 43, palette: lajolla};
+
+// 2. Convert map values into a standard 3-band RGB image canvas
+var styled = img.visualize(vis);
+
+// 3. Generate the precise 1.5-width black boundary outline
+var outline = POS.style({
+  color: '000000', 
+  width: 1.5,
+  fillColor: '00000000' 
+});
+
+// 4. Blend the map data and the black outline together (keeps line crisp on top)
+var rgbCombined = styled.blend(outline);
+
+// 5. Create a solid, global 3-band white base layer matching GEE's channel names
+var whiteBackground = ee.Image.constant([255, 255, 255])
+  .rename(['vis-red', 'vis-green', 'vis-blue'])
+  .toByte();
+
+// 6. Overlay your map directly on top of the solid white base layer
+// Your map covers the inside; the white background shows through the empty corners
+var finalRgb = whiteBackground.blend(rgbCombined);
+
+// 7. Select the clean 3 channels to guarantee compatibility with PPT/image viewers
+var finalExport = finalRgb.select(['vis-red', 'vis-green', 'vis-blue']);
+
+// 8. Run the export task to your Google Drive
+Export.image.toDrive({
+  image: finalExport,
+  description: 'FD_dur',
+  fileNamePrefix: 'FD_dur',
+  region: POS.geometry().bounds(), // Safe bounding box rectangle
+  scale: 500,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',    
+  maxPixels: 1e13
+});*/
+
+//land cover///////////////////////////////////////////////////////////////////////////
+// MCD12Q1 (MODIS Land Cover Type, 500 m)
+var lc = ee.ImageCollection('MODIS/061/MCD12Q1')
+            .select('LC_Type1') // IGBP class
+            .filterDate('2024-01-01', '2024-12-31')   // pick a representative year
+            .first()
+            .clip(POS);
+            
+// IGBP -> 4 groups
+// Forests: 1–5
+// Savanna/Shrub: 6,7,8,9
+// Grasslands: 10
+// Croplands: 12 and 14 (mosaic)
+// Group mapping: Forests(1–5)=1, Sav/Shrub(6–9)=2, Grasslands(10)=3, Croplands(12,14)=4
+var lcWanted = [1,2,3,4,5,6,7,8,9,10,12,14];
+var lcGroups = [1,1,1,1,1,2,2,2,2,3, 4, 4];
+
+var lcGroup = lc.remap(lcWanted, lcGroups).rename('class');
+// keep only mapped classes
+lcGroup = lcGroup.updateMask(lcGroup.gt(0));
+
+// stack bands: freq, num, dur, class (in this order)
+// var metrics = FD_freq.rename('freq')
+//   .addBands(FD_count.rename('num'))
+//   .addBands(FD_dur.rename('dur'))
+//   .addBands(lcGroup.rename('class'));
+  
+// stack bands: freq, num, dur, class (in this order)
+// freq & num should include zeros
+// dur should be event-conditional (only where num>0)
+
+var metrics = FD_freq.unmask(0).rename('freq')
+  .addBands(FD_count.unmask(0).rename('num'))
+  .addBands(FD_dur.updateMask(FD_count.gt(0)).rename('dur'))
+  .addBands(lcGroup.rename('class'));
+
+// Make sure these exist already: POS, freqPct, nEvents, meanDurDays, lcGroup (1=Forests,2=Sav/Shrub,3=Grass,4=Crops)
+var posGeom = POS.geometry();
+
+// // Stack the three metrics
+// var metrics = freqA.rename('freq')
+//   .addBands(nEventsA.rename('num'))
+//   .addBands(durA.rename('dur'));
+
+// Class ids and names
+var classes = ee.List([1,2,3,4]);
+var classNames = ee.Dictionary({1:'Forests',2:'Savannas_Shrublands',3:'Grasslands',4:'Croplands'});
+
+// Compute mean of each metric within each class mask
+// ===== 1) Compute individual Land Cover Class statistics (Your original loop code) =====
+var classFeatures = classes.map(function(c){
+  c = ee.Number(c);
+  var masked = metrics.updateMask(lcGroup.eq(c));
+  var stats = masked.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: posGeom,
+    scale: 500,
+    maxPixels: 1e13,
+    tileScale: 4
+  });
+  return ee.Feature(null, {
+    class_id: c,
+    class_name: classNames.get(c),
+    freq_mean_pct: stats.get('freq'),
+    num_mean:      stats.get('num'),
+    dur_mean_days: stats.get('dur')
+  });
+});
+
+// ===== 2) Compute the "All" Row (Global Regional Means) =====
+var statsAll = metrics.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: posGeom,
+  scale: 500,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+var featureAll = ee.Feature(null, {
+  class_id: 5, // Assigned unique ID for sorting/indexing
+  class_name: 'All',
+  freq_mean_pct: statsAll.get('freq'),
+  num_mean:      statsAll.get('num'),
+  dur_mean_days: statsAll.get('dur')
+});
+
+// ===== 3) Combine class features and the "All" feature into a single FeatureCollection =====
+var tableWithAll = ee.FeatureCollection(classFeatures).merge(ee.FeatureCollection([featureAll]));
+
+// ===== 4) Output the final consolidated data table to your Console window =====
+print('FD metrics by land-cover group with ALL (means)', tableWithAll);
+
+
+// // outline at the end
+// var posOutline = POS.style({
+//   color: '000000',     // black line
+//   width: 1.5,            // stroke width (px)
+//   fillColor: '00000000'// transparent fill
+// });
+// Map.addLayer(posOutline, {}, 'POS outline');
+
+// function addVerticalLegend(title, palette, min, max, position) {
+//   var barHeight = 120; // px
+
+//   var colorBar = ui.Thumbnail({
+//     image: ee.Image.pixelLonLat().select(1),
+//     params: {bbox:[0,0,0.1,1], dimensions:'12x' + barHeight, format:'png', min:0, max:1, palette:palette},
+//     style: {margin:'0 4px 0 0', maxHeight: barHeight + 'px', maxWidth:'12px'}
+//   });
+
+//   // Make the labels column the SAME height and vertical
+//   var labels = ui.Panel({
+//     widgets: [
+//       ui.Label(max, {fontSize:'12px', margin:'0 0 2px 4px'}),
+//       ui.Label('',  {stretch:'vertical'}),          // spacer fills remaining height
+//       ui.Label(min, {fontSize:'12px', margin:'0 0 0 4px'})
+//     ],
+//     layout: ui.Panel.Layout.flow('vertical'),
+//     style: {height: barHeight + 'px'}               // key line
+//   });
+
+//   var barWithLabels = ui.Panel([colorBar, labels], ui.Panel.Layout.flow('horizontal'));
+
+//   var legend = ui.Panel({
+//     widgets: [ui.Label(title, {fontWeight:'bold', fontSize:'14px', margin:'0 0 6px 0'}), barWithLabels],
+//     style: {position: position || 'bottom-right', padding:'8px 12px', backgroundColor:'ffffffcc'}
+//   });
+
+//   Map.add(legend);
+// }
+
+// // ============================================================
+// // Segmented vertical legend (discrete colour blocks + tick labels)
+// // ============================================================
+// function addSegmentedLegend(title, palette, minVal, maxVal, position, nSegments) {
+//   nSegments = nSegments || 7;   // default 7 segments (like reference figure)
+
+//   var legend = ui.Panel({
+//     style: {
+//       position       : position,
+//       padding        : '8px 10px',
+//       backgroundColor: 'rgba(255,255,255,0.92)',
+//       border         : '1px solid #ccc',
+//       width          : '72px'
+//     }
+//   });
+
+//   // ── Title ────────────────────────────────────────────────
+//   legend.add(ui.Label({
+//     value: title,
+//     style: {
+//       fontWeight  : 'bold',
+//       fontSize    : '11px',
+//       margin      : '0 0 4px 0',
+//       textAlign   : 'center',
+//       whiteSpace  : 'pre'    // allow \n line breaks in title
+//     }
+//   }));
+
+//   // ── Build colour steps from palette ──────────────────────
+//   // Interpolate palette into nSegments colours
+//   var paletteSize = palette.length;
+//   var segColors   = [];
+//   var segLabels   = [];   // top edge of each segment = tick label
+
+//   for (var s = 0; s < nSegments; s++) {
+//     // Map segment index → palette index
+//     // var palIdx = Math.round(s / (nSegments - 1) * (paletteSize - 1));
+
+//     // AFTER (correct — dark at top, cream at bottom)
+//     var palIdx = Math.round((1 - s / (nSegments - 1)) * (paletteSize - 1));
+
+//     segColors.push(palette[palIdx]);
+
+//     // Tick label: top edge of segment (highest value first)
+//     var tickVal = maxVal - s * (maxVal - minVal) / nSegments;
+//     segLabels.push(Math.round(tickVal));
+//   }
+//   // Bottom label (minVal)
+//   segLabels.push(minVal);
+
+//   // ── Stack segments top → bottom ───────────────────────────
+//   for (var i = 0; i < nSegments; i++) {
+//     var row = ui.Panel({
+//       layout: ui.Panel.Layout.flow('horizontal'),
+//       style : { margin: '0', padding: '0' }
+//     });
+
+//     // Colour block
+//     row.add(ui.Label({
+//       style: {
+//         backgroundColor: segColors[i],
+//         padding        : '0',
+//         margin         : '0',
+//         width          : '24px',
+//         height         : '20px',
+//         border         : '0.5px solid rgba(0,0,0,0.15)'
+//       }
+//     }));
+
+//     // Tick label (top edge of this segment)
+//     row.add(ui.Label({
+//   value: String(segLabels[i]),
+//   style: {
+//     fontSize: '10px',
+//     margin  : '0 0 0 4px',
+//     padding : '0',
+//     color   : '#333'
+//     // ← lineHeight removed
+//     }
+//   }));
+
+
+//     legend.add(row);
+//   }
+
+//   // Bottom-most tick label (minVal)
+//   legend.add(ui.Label({
+//     value: String(segLabels[nSegments]),
+//     style: {
+//       fontSize: '10px',
+//       margin  : '0 0 0 28px',
+//       padding : '0',
+//       color   : '#333'
+//     }
+//   }));
+
+//   Map.add(legend);
+// }
+
+// function addSegmentedLegend(title, palette, minVal, maxVal, position, nTicks) {
+//   nTicks = nTicks || 7;
+
+//   var legend = ui.Panel({
+//     style: { position: position, padding: '8px 10px',
+//             backgroundColor: 'rgba(255,255,255,0.92)',
+//             border: '1px solid #ccc', width: '80px' }
+//   });
+
+//   // Title
+//   legend.add(ui.Label({ value: title,
+//     style: { fontWeight: 'bold', fontSize: '14px', margin: '0 0 4px 0' }
+//   }));
+
+//   // ── Continuous gradient bar ──
+//   var colorBar = ui.Thumbnail({
+//     image: ee.Image.pixelLonLat().select('latitude'),
+//     params: {
+//       bbox      : [0, 0, 0.1, 1],
+//       dimensions: '12x140',
+//       format    : 'png',
+//       min: 0, max: 1,
+//       // palette   : palette.slice().reverse()
+//       palette   : palette.slice()
+//     },
+//     style: { stretch: 'vertical', margin: '0', padding: '0' }
+//   });
+
+//   // ── Tick marks panel ──
+//   var ticksPanel = ui.Panel({ style: { margin: '0', padding: '0' } });
+//   for (var i = 0; i <= nTicks; i++) {
+//     ticksPanel.add(ui.Label({
+//       value: '-',
+//       style: {
+//         fontSize: '10px',
+//         color   : '#333',
+//         margin  : i === 0 ? '0 0 0 0' : (140/nTicks - 14) + 'px 0 0 0',
+//         padding : '0'
+//       }
+//     }));
+//   }
+
+//   // ── Tick labels panel ──
+//   var labelsPanel = ui.Panel({ style: { margin: '0', padding: '0' } });
+//   for (var i = 0; i <= nTicks; i++) {
+//     var val = Math.round(maxVal - i * (maxVal - minVal) / nTicks);
+//     // var val = Math.round(minVal + i * (maxVal - minVal) / nTicks);  // ← was maxVal - ...
+//     labelsPanel.add(ui.Label({
+//       value: String(val),
+//       style: {
+//         fontSize: '10px',
+//         margin  : i === 0 ? '0 0 0 4px' : (140/nTicks - 14) + 'px 0 0 4px',
+//         padding : '0',
+//         color   : '#333'
+//       }
+//     }));
+//   }
+
+
+//   // ── Row: bar | ticks | labels ──
+//   legend.add(ui.Panel({
+//     widgets: [
+//       ui.Panel({ widgets: [colorBar], style: { margin: '0', padding: '0' } }),
+//       ticksPanel,
+//       labelsPanel
+//     ],
+//     layout: ui.Panel.Layout.flow('horizontal'),
+//     style : { margin: '0', padding: '0' }
+//   }));
+
+//   Map.add(legend);
+// }
+
+function addSegmentedLegend(title, palette, minVal, maxVal, position, nTicks) {
+  nTicks = nTicks || 7;
+
+  var legend = ui.Panel({
+    style: { 
+      position: position, 
+      padding: '8px 12px',
+      backgroundColor: 'rgba(255,255,255,0.92)',
+      border: '1px solid #ccc'
+    }
+  });
+
+  // Title
+  legend.add(ui.Label({ 
+    value: title,
+    style: { 
+      fontWeight: 'bold', 
+      fontSize: '14px', 
+      margin: '0 0 6px 0',
+      whiteSpace: 'nowrap'
+    }
+  }));
+
+  // ── Continuous gradient bar ──
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select('latitude'),
+    params: {
+      bbox      : [0, 0, 0.1, 1],
+      dimensions: '12x140',
+      format    : 'png',
+      min: 0, max: 1,
+      palette   : palette.slice()
+    },
+    // CRITICAL: Set right margin to 0px so the ticks can touch it
+    style: { stretch: 'vertical', margin: '0 0px 0 0', padding: '0' } 
+  });
+
+  // ── Tick marks panel ──
+  var ticksPanel = ui.Panel({ 
+    // CRITICAL: Set left margin to 0px to eliminate the gap
+    style: { margin: '0 0 0 0px', padding: '0' } 
+  });
+  
+  for (var i = 0; i <= nTicks; i++) {
+    ticksPanel.add(ui.Label({
+      value: '-',
+      style: {
+        fontSize: '10px',
+        color   : '#333',
+        // Kept your formula intact, but ensured no extra horizontal padding ruins the connection
+        margin  : i === 0 ? '0 0 0 0' : (140/nTicks - 14) + 'px 0 0 0',
+        padding : '0'
+      }
+    }));
+  }
+
+  // // ── Tick labels panel ──
+  // var labelsPanel = ui.Panel({ style: { margin: '0', padding: '0' } });
+  // for (var i = 0; i <= nTicks; i++) {
+  //   var val = Math.round(maxVal - i * (maxVal - minVal) / nTicks);
+  //   labelsPanel.add(ui.Label({
+  //     value: String(val),
+  //     style: {
+  //       fontSize: '10px',
+  //       margin  : i === 0 ? '0 0 0 4px' : (140/nTicks - 14) + 'px 0 0 4px',
+  //       padding : '0',
+  //       color   : '#333'
+  //     }
+  //   }));
+  // }
+  
+  // ── Tick labels panel ──
+  var labelsPanel = ui.Panel({ style: { margin: '0', padding: '0' } });
+  for (var i = 0; i <= nTicks; i++) {
+    var val = maxVal - i * (maxVal - minVal) / nTicks;
+    
+    // Check if the value is a decimal. If yes, keep 1 decimal place; otherwise keep as integer.
+    var formattedVal = (minVal % 1 !== 0 || maxVal % 1 !== 0) ? val.toFixed(1) : Math.round(val);
+    
+    labelsPanel.add(ui.Label({
+      value: String(formattedVal),
+      style: {
+        fontSize: '10px',
+        margin  : i === 0 ? '0 0 0 4px' : (140/nTicks - 14) + 'px 0 0 4px',
+        padding : '0',
+        color   : '#333'
+      }
+    }));
+  }
+
+  // ── Row: bar | ticks | labels ──
+  legend.add(ui.Panel({
+    widgets: [
+      colorBar, 
+      ticksPanel,
+      labelsPanel
+    ],
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style : { margin: '0', padding: '0' }
+  }));
+
+  Map.add(legend);
+}
+
+// ===== PET, AET, ESR long-term means (2000–2024) =====/////////////////////////////////////////////////
+
+// 0) Prep ET & PET in mm per 8-day, keep time
+var et_mmIC  = et.select('ET').map(function(img){ return img.multiply(0.1).rename('ETmm')
+  .copyProperties(img, ['system:time_start']); });
+var pet_mmIC = et.select('PET').map(function(img){ return img.multiply(0.1).rename('PETmm')
+  .copyProperties(img, ['system:time_start']); });
+
+var yearsPETET = ee.List.sequence(2000, 2024);
+
+// 1) Annual sums (mm/yr)
+var annualET = ee.ImageCollection.fromImages(yearsPETET.map(function(y){
+  y = ee.Number(y);
+  return et_mmIC.filter(ee.Filter.calendarRange(y, y, 'year')).sum()
+           .rename('AET_sum_mm_yr').set('year', y).clip(POS);
+}));
+
+var annualPET = ee.ImageCollection.fromImages(yearsPETET.map(function(y){
+  y = ee.Number(y);
+  return pet_mmIC.filter(ee.Filter.calendarRange(y, y, 'year')).sum()
+           .rename('PET_sum_mm_yr').set('year', y).clip(POS);
+}));
+
+// 2) Long-term mean AET & PET (mm/yr)
+var AET_mean_mm_yr = annualET.mean().rename('AET_mean_mm_yr');
+var PET_mean_mm_yr = annualPET.mean().rename('PET_mean_mm_yr');
+
+// 3) Annual ESR = (annual ET) / (annual PET), then multi-year mean
+var annualESR = annualET.map(function(etYear){
+  var y   = ee.Number(etYear.get('year'));
+  var pet = annualPET.filter(ee.Filter.eq('year', y)).first();
+  // Guard against divide-by-zero
+  return etYear.divide(pet).rename('ESR_yr').updateMask(pet.gt(0)).set('year', y).clip(POS);
+});
+var ESR_mean = annualESR.mean().rename('ESR_mean');
+
+// ===== Visualization (tune ranges to your region) =====
+var ylOrRd = ['#ffffcc','#ffeda0','#fed976','#feb24c','#fd8d3c','#f03b20','#bd0026'];
+var bluCyan = ['#f7fbff','#deebf7','#c6dbef','#9ecae1','#6baed6','#3182bd','#08519c'];
+// Reverse of RdYlBu to match Kang et al. (low ESR = red, high ESR = blue)
+var rdylbu = ['#a50026','#d73027','#f46d43','#fdae61','#fee090',
+              '#ffffbf','#e0f3f8','#abd9e9','#74add1','#4575b4','#313695'];
+
+// Rough, poster-friendly ranges (adjust if needed)
+var petVis = {min:1500,  max:2000, palette:ylOrRd};   // PET mm/yr
+var aetVis = {min:300,  max:1200,  palette:bluCyan};  // AET mm/yr (use warm if you prefer)
+var esrVis = {min:0.2,  max:0.8,  palette:rdylbu}; // ESR unitless
+
+Map.addLayer(PET_mean_mm_yr, petVis, 'PET mean (mm/yr)');
+Map.addLayer(AET_mean_mm_yr, aetVis, 'AET mean (mm/yr)');
+Map.addLayer(ESR_mean,      esrVis, 'ESR mean (-)');
+
+// Legends (uses your addVerticalLegend)
+// addVerticalLegend('PET mean (mm/yr)', petVis.palette, petVis.min, petVis.max, 'bottom-left');
+// addVerticalLegend('AET mean (mm/yr)', aetVis.palette, aetVis.min, aetVis.max, 'bottom-left');
+// addVerticalLegend('ESR mean (-)',     esrVis.palette, esrVis.min, esrVis.max, 'bottom-left');
+
+// Implement the segmented legends for PET, AET, and ESR
+// addSegmentedLegend('PET (mm/year)', petVis.palette, petVis.min, petVis.max, 'bottom-left', 5);
+// addSegmentedLegend('AET (mm/year)', aetVis.palette, aetVis.min, aetVis.max, 'bottom-left', 3);
+// addSegmentedLegend('ESR (-)',     esrVis.palette, esrVis.min, esrVis.max, 'bottom-left', 3);
+
+// Optional: draw outline again so it stays on top
+Map.addLayer(POS.style({color:'000000', width:1.5, fillColor:'00000000'}), {}, 'POS outline');
+
+// ===== GPP & WUE long-term means (2000–2024) =====/////////////////////////////////////////////////
+
+// 1) Prep raw 8-day GPP collection (Scale factor 0.0001 to convert to kgC/m2, then * 1000 -> gC/m2)
+var gpp_gC_IC = ee.ImageCollection('MODIS/061/MOD17A2HGF')
+  .select('Gpp')
+  .filterDate('2000-01-01', '2024-12-31')
+  .filterBounds(POS)
+  .map(function(img) {
+    return img.multiply(0.0001).multiply(1000)   // scale to gC m⁻² per 8-days
+      .rename('GPP_gCm2')
+      .copyProperties(img, ['system:time_start']);
+  });
+
+var yearsGPP = ee.List.sequence(2000, 2024);
+
+// 2) Compute Annual sums for GPP & Annual WUE
+var annualGPP = ee.ImageCollection.fromImages(yearsGPP.map(function(y){
+  y = ee.Number(y);
+  
+  // Annual sum of GPP (gC / m2 / yr)
+  var gppSum = gpp_gC_IC.filter(ee.Filter.calendarRange(y, y, 'year')).sum()
+                        .rename('GPP_sum_yr').clip(POS);
+                        
+  // Corresponding Annual sum of AET (retrieved from your existing collection)
+  var aetSum = annualET.filter(ee.Filter.eq('year', y)).first();
+  
+  // Calculate Annual WUE = GPP_sum / AET_sum [gC / kgH2O] or [gC / m2 / mm]
+  var wueYear = gppSum.divide(aetSum).rename('WUE_yr')
+                      .updateMask(aetSum.gt(0)).clip(POS);
+                      
+  return gppSum.addBands(wueYear).set('year', y);
+}));
+
+// 3) Long-term means (2000–2024)
+var GPP_mean = annualGPP.select('GPP_sum_yr').mean().rename('GPP_mean');
+var WUE_mean = annualGPP.select('WUE_yr').mean().rename('WUE_mean');
+
+// ===== Visualization Styles (ColorBrewer Updates) =====
+
+// colorbrewer.BuGn (9-class sequence: Light blue/white to dark green for GPP)
+var colorbrewer_BuGn = ['#f7fcfd','#e5f5f9','#ccece6','#99d8c9','#66c2a4','#41ae76','#238b45','#006d2c','#00441b'];
+
+// colorbrewer.GnBu (9-class sequence: Light green/white to deep blue for WUE)
+var colorbrewer_GnBu = ['#f7fcf0','#e0f3db','#ccebc5','#a8ddb5','#7bccc4','#4eb3d3','#2b8cbe','#0868ac','#084081'];
+
+// Visualization Parameters using the new palettes
+var gppVis = {min: 300, max: 2400, palette: colorbrewer_BuGn}; // GPP (g C/m²/year)
+var wueVis = {min: 0.8, max: 2.5,  palette: colorbrewer_GnBu}; // WUE [g C/kg H₂O]
+
+// Display layers on the Map Canvas
+Map.addLayer(GPP_mean, gppVis, 'GPP mean (BuGn)');
+Map.addLayer(WUE_mean, wueVis, 'WUE mean (GnBu)');
+
+// ===== Dynamic Segmented Legends =====
+// addSegmentedLegend('GPP (g C/m²/year)', gppVis.palette, gppVis.min, gppVis.max, 'bottom-left', 7);
+// addSegmentedLegend('WUE (g C/kg H₂O)',   wueVis.palette, wueVis.min, wueVis.max, 'bottom-left', 3);
+// Push POS border on very top layer
+Map.addLayer(POS.style({color:'000000', width:1.5, fillColor:'00000000'}), {}, 'POS boundary outline');
+
+
+
+// ===== Calculate Exact Min and Max Boundaries =====
+/*
+// Reduce the regions to find absolute min & max within your POS area
+var gppStats = GPP_mean.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500, // Matches your dataset scale
+  maxPixels: 1e13
+});
+
+var wueStats = WUE_mean.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500,
+  maxPixels: 1e13
+});
+
+var aetStats = AET_mean_mm_yr.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500, // Matches your dataset scale
+  maxPixels: 1e13
+});
+
+var petStats = PET_mean_mm_yr.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500,
+  maxPixels: 1e13
+});
+
+var esrStats = ESR_mean.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: POS.geometry(),
+  scale: 500,
+  maxPixels: 1e13
+});
+// Print the results directly to the right-hand Console tab
+print('--- GPP True Range ---', gppStats);
+print('--- WUE True Range ---', wueStats);
+print('--- AET True Range ---', aetStats);
+print('--- PET True Range ---', petStats);
+print('--- ESR True Range ---', esrStats);
+*/
+
+
+////////////////////////////////////////////////////////////////////////////////////
+// EXPORT to Drive and convert the format into png and import into PPT -- IT WORKS!!
+/*
+var img = GPP_mean.clip(POS);
+var vis = {min: 300, max: 2400, palette: colorbrewer_BuGn};
+
+// 1. Convert data to RGB and immediately unmask it to a solid white background (or black)
+// This removes the ghost alpha channel that breaks desktop image viewers
+var styled = img.visualize(vis).unmask(255); // 255 = White background where there is no data
+
+// 2. Generate the outline
+var outline = POS.style({
+  color: '000000', 
+  width: 1.5,
+  fillColor: '00000000' // Using standard GEE transparent fill syntax
+});
+
+// 3. Blend them together
+var rgb = styled.blend(outline);
+
+// 4. Force GEE to only export 3 channels (Red, Green, Blue) to guarantee compatibility
+var finalExport = rgb.select(['vis-red', 'vis-green', 'vis-blue']);
+
+Export.image.toDrive({
+  image: finalExport,
+  description: 'GPP',
+  fileNamePrefix: 'GPP',
+  region: POS.geometry().bounds(), // Use bounds to avoid clipping errors
+  scale: 500,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',    
+  maxPixels: 1e13
+});
+*/
+/*
+// ===== 1) Combine the Eco-Hydrological Long-Term Means into a Single Image =====
+var ecoMetrics = ESR_mean.rename('ESR')
+  .addBands(AET_mean_mm_yr.rename('AET'))
+  .addBands(PET_mean_mm_yr.rename('PET'))
+  .addBands(GPP_mean.rename('GPP'))
+  .addBands(WUE_mean.rename('WUE'));
+
+// ===== 2) Calculate the "All" Column (Entire Region Mean) =====
+var statsAll = ecoMetrics.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: posGeom,
+  scale: 500,
+  maxPixels: 1e13,
+  tileScale: 16
+});
+
+var featureAll = ee.Feature(null, {
+  'class_id': 5,
+  'Landcover Type': 'All',
+  'ESR (-)': statsAll.get('ESR'),
+  'AET (mm/year)': statsAll.get('AET'),
+  'PET (mm/year)': statsAll.get('PET'),
+  'GPP (g C/m2/year)': statsAll.get('GPP'),
+  'WUE (g C/kg/H2O)': statsAll.get('WUE')
+});
+
+// ===== 3) Calculate Individual Land Cover Classes (Using loop to prevent memory errors) =====
+var classFeatures = classes.map(function(c){
+  c = ee.Number(c);
+  
+  // Mask eco layers to only process the current landcover group
+  var maskedEco = ecoMetrics.updateMask(lcGroup.eq(c));
+  
+  var stats = maskedEco.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: posGeom,
+    scale: 500,
+    maxPixels: 1e13,
+    tileScale: 16
+  });
+  
+  return ee.Feature(null, {
+    'class_id': c,
+    'Landcover Type': classNames.get(c),
+    'ESR (-)': stats.get('ESR'),
+    'AET (mm/year)': stats.get('AET'),
+    'PET (mm/year)': stats.get('PET'),
+    'GPP (g C/m2/year)': stats.get('GPP'),
+    'WUE (g C/kg/H2O)': stats.get('WUE')
+  });
+});
+
+// ===== 4) Combine Class Stats and "All" Stats into One FeatureCollection =====
+var finalKangTable = ee.FeatureCollection(classFeatures).merge(ee.FeatureCollection([featureAll]));
+
+// ===== 5) Print everything out to the Console =====
+print('Meteorology metrics by land-cover group with ALL', finalKangTable);
+*/
+
+/*
+// ===== BATCH EXPORT ALL 5 ANNUAL METRICS (2000-2024) TO DRIVE =====
+// Create a native client-side array of years to generate individual export tasks
+var yearsToExport = [];
+for (var y = 2000; y <= 2024; y++) {
+  yearsToExport.push(y);
+}
+
+// Loop through each year and configure the export stack
+yearsToExport.forEach(function(year) {
+  
+  // 1. Filter out and isolate the single image band for this specific year
+  var petImg = annualPET.filter(ee.Filter.eq('year', year)).first().select('PET_sum_mm_yr').rename('PET');
+  var aetImg = annualET.filter(ee.Filter.eq('year', year)).first().select('AET_sum_mm_yr').rename('AET');
+  var esrImg = annualESR.filter(ee.Filter.eq('year', year)).first().select('ESR_yr').rename('ESR');
+  var gppImg = annualGPP.filter(ee.Filter.eq('year', year)).first().select('GPP_sum_yr').rename('GPP');
+  var wueImg = annualGPP.filter(ee.Filter.eq('year', year)).first().select('WUE_yr').rename('WUE');
+  
+  // 2. Combine all 5 individual variable bands into a single multi-band image stack
+  var annualStack = petImg
+    .addBands(aetImg)
+    .addBands(esrImg)
+    .addBands(gppImg)
+    .addBands(wueImg)
+    .clip(POS)
+    .toFloat(); // Forces uniform floating-point precision data type
+    
+  // 3. Send the image to the GEE Tasks manager on the right side panel
+  Export.image.toDrive({
+    image: annualStack,
+    description: 'Annual_Metrics_Stack_' + year,
+    fileNamePrefix: 'Annual_Metrics_' + year,
+    region: POS.geometry().bounds(), // Safe layout bounds geometry
+    scale: 500,                      // Native grid resolution match
+    crs: 'EPSG:4326',                // Standard WGS84 coordinates
+    fileFormat: 'GeoTIFF',
+    maxPixels: 1e13,
+    folder: 'GEE_Exports'            // Name of the folder created in Google Drive
+  });
+});
+*/
+
+// Intensity ////////////////////////////////////////////////////////////////////////
+var years      = ee.List.sequence(startYear, endYear);
+var totalYears = endYear - startYear + 1;
+
+var proj  = baseProj;   // MODIS 500 m projection you already defined earlier
+var scale = 500;
+
+
+// 0) Sort windows once
+var fdI = fdWinWithIntensity.sort('system:time_start');
+
+// Add a dummy last step to close events that persist to the end of the record
+var last = ee.Image(fdI.sort('system:time_start', false).first());
+
+var dummy = ee.Image(0).rename(['FDwin3'])
+  .addBands(ee.Image(0).rename(['FD_intensity']))
+  .setDefaultProjection(proj)
+  .reproject({crs: proj.crs(), scale: scale})
+  .copyProperties(last, ['system:time_start'])
+  .set('system:time_start', ee.Date(last.get('system:time_start')).advance(8,'day').millis());
+
+fdI = fdI
+  .select(['FDwin3','FD_intensity'])
+  .merge(ee.ImageCollection([dummy]))
+  .sort('system:time_start');
+
+// 1) Convert to list for iterate (memory-safe; no flatten)
+var L = fdI.toList(fdI.size());
+
+// 2) Iterate through time, track events per pixel, and emit EVENT-END records
+//    Event intensity = max FD_intensity within that contiguous event
+//    Event duration  = (nWindows + (MIN_DSESR_LEN - 1)) * 8 days
+//    Event start-year stored as a band (startYr) for START-year frequency
+
+var init = ee.Dictionary({
+  prevAny: ee.Image(0).toByte(),      // previous FDwin3 (0/1)
+  maxInt:  ee.Image(0).toByte(),      // running max intensity in current event
+  nWin:    ee.Image(0).toInt16(),     // # windows in current event
+  startYr: ee.Image(0).toInt16(),     // start year of current event (per pixel)
+  out:     ee.List([])                // list of sparse event-end images
+});
+
+var iter = ee.List.sequence(0, fdI.size().subtract(1)).iterate(function(i, state){
+  state = ee.Dictionary(state);
+  i = ee.Number(i);
+
+  var img   = ee.Image(L.get(i));
+  var any   = img.select('FDwin3').unmask(0).toByte();         // 0/1
+  var inten = img.select('FD_intensity').unmask(0).toByte();   // 0..4
+
+  var yr = ee.Number(ee.Date(img.get('system:time_start')).get('year'));
+
+  var prevAny = ee.Image(state.get('prevAny'));
+  var maxInt  = ee.Image(state.get('maxInt'));
+  var nWin    = ee.Image(state.get('nWin'));
+  var startYr = ee.Image(state.get('startYr'));
+  var outList = ee.List(state.get('out'));
+
+  var start = any.eq(1).and(prevAny.eq(0)).toByte();  // event starts this step
+  var end   = any.eq(0).and(prevAny.eq(1)).toByte();  // event ends at previous step
+
+  // Update running state when inside event
+  var maxInt_new = ee.Image(0).toByte()
+    .where(start.eq(1), inten)                               // start: reset to this window intensity
+    .where(any.eq(1).and(start.eq(0)), maxInt.max(inten));   // continue: max over event
+
+  var nWin_new = ee.Image(0).toInt16()
+    .where(start.eq(1), 1)
+    .where(any.eq(1).and(start.eq(0)), nWin.add(1));
+
+  var startYr_new = ee.Image(0).toInt16()
+    .where(start.eq(1), yr)
+    .where(any.eq(1).and(start.eq(0)), startYr);
+
+  // Emit EVENT-END record (sparse) using STATE FROM PREVIOUS STEP:
+  // maxInt & nWin & startYr correspond to the event that just ended.
+  var durDays = nWin.add(MIN_DSESR_LEN - 1).multiply(8).toFloat();
+
+  var e1 = end.and(maxInt.eq(1)).rename('e1').toByte();
+  var e2 = end.and(maxInt.eq(2)).rename('e2').toByte();
+  var e3 = end.and(maxInt.eq(3)).rename('e3').toByte();
+  var e4 = end.and(maxInt.eq(4)).rename('e4').toByte();
+
+  var d1 = durDays.updateMask(e1).rename('d1');
+  var d2 = durDays.updateMask(e2).rename('d2');
+  var d3 = durDays.updateMask(e3).rename('d3');
+  var d4 = durDays.updateMask(e4).rename('d4');
+
+  // var eventEndRecord = e1.addBands([e2,e3,e4,d1,d2,d3,d4, startYr.rename('startYr').toInt16()])
+  //   .copyProperties(img, ['system:time_start']); // timestamp = current step (first non-event step)
+    
+  var eventEndRecord = e1.addBands([e2,e3,e4,d1,d2,d3,d4, startYr.rename('startYr').toInt16()])
+    .setDefaultProjection(proj)
+    .reproject({crs: proj.crs(), scale: scale})
+    .copyProperties(img, ['system:time_start']);
+    
+
+  outList = outList.add(eventEndRecord);
+
+  // Advance state (reset outside events)
+  return ee.Dictionary({
+    prevAny: any,
+    maxInt:  ee.Image(0).toByte().where(any.eq(1), maxInt_new),
+    nWin:    ee.Image(0).toInt16().where(any.eq(1), nWin_new),
+    startYr: ee.Image(0).toInt16().where(any.eq(1), startYr_new),
+    out:     outList
+  });
+}, init);
+
+var outList = ee.List(ee.Dictionary(iter).get('out'));
+var outIC   = ee.ImageCollection.fromImages(outList);
+
+
+// =====================================================
+// STEP 4A) EVENT COUNTS by intensity (FD1–FD4)
+// =====================================================
+var FD1_count = outIC.select('e1').sum().rename('FD1_count');
+var FD2_count = outIC.select('e2').sum().rename('FD2_count');
+var FD3_count = outIC.select('e3').sum().rename('FD3_count');
+var FD4_count = outIC.select('e4').sum().rename('FD4_count');
+
+// FD1_count = FD1_count.unmask(0);
+// FD1_freq  = FD1_freq.unmask(0);
+
+
+// (optional) total event count (all intensities)
+var nEvents_all = FD1_count.add(FD2_count).add(FD3_count).add(FD4_count).rename('FD_events_all');
+
+// =====================================================
+// STEP 4C) MEAN DURATION (days) by intensity (true EVENT duration)
+// =====================================================
+function meanDur(countImg, dBand){
+  var durSum = outIC.select(dBand).sum();
+  return durSum.divide(countImg).updateMask(countImg.gt(0));
+}
+
+var FD1_dur = meanDur(FD1_count, 'd1').rename('FD1_meanDurDays');
+var FD2_dur = meanDur(FD2_count, 'd2').rename('FD2_meanDurDays');
+var FD3_dur = meanDur(FD3_count, 'd3').rename('FD3_meanDurDays');
+var FD4_dur = meanDur(FD4_count, 'd4').rename('FD4_meanDurDays');
+
+// =====================================================
+// STEP 4B) FREQUENCY (% years with ≥1 FDx WINDOW) by window year
+// Dec–Jan spanning events can be counted in BOTH years (because windows exist in both).
+// =====================================================
+/*
+function freqByLevel_windows(level){
+  // 1/0 mask for FDwin3 AND intensity==level
+  var winLevel = fdWinWithIntensity.map(function(img){
+    var y  = ee.Date(img.get('system:time_start')).get('year');
+    var m  = img.select('FDwin3').unmask(0).toByte()
+               .and(img.select('FD_intensity').eq(level)).toByte();
+    return m.rename('m').set('year', y);
+  });
+
+  // per-year: 1 if any window exists, else 0
+  var anyPerYear = ee.ImageCollection(
+    years.map(function(y){
+      y = ee.Number(y);
+      var yrIC = winLevel.filter(ee.Filter.eq('year', y));
+      return ee.Image(ee.Algorithms.If(
+        yrIC.size().gt(0),
+        yrIC.max(),              // 1 where any FDx window in that year
+        ee.Image(0).rename('m')  // no windows
+      )).rename('any');
+    })
+  );
+
+  // sum of years with FDx windows / total years * 100
+  return anyPerYear.sum()
+                   .divide(totalYears)
+                   .multiply(100)
+                   .rename('FD' + level + '_freqPct');
+}
+
+var FD1_freq = freqByLevel_windows(1);
+var FD2_freq = freqByLevel_windows(2);
+var FD3_freq = freqByLevel_windows(3);
+var FD4_freq = freqByLevel_windows(4);
+*/
+
+// =====================================================
+// STEP 4B) REVISED EVENT FREQUENCY (% of years with an event peaking at FDx)
+// Safe, optimized implementation preventing zero-band and memory errors
+// =====================================================
+function freqByLevel_events(level) {
+  var targetBand = 'e' + level; 
+  
+  // Isolate the target intensity and map calendar years to the images
+  var eventsWithYear = outIC.select(targetBand).map(function(img) {
+    var y = ee.Date(img.get('system:time_start')).get('year');
+    return img.rename('occurred').set('year', y);
+  });
+  
+  // Calculate annual occurrence using a safe collection-merge structure
+  var annualOccurrence = ee.ImageCollection(
+    years.map(function(y) {
+      y = ee.Number(y);
+      var yearCollection = eventsWithYear.filter(ee.Filter.eq('year', y));
+      
+      // Bulletproof dummy layer prevents zero-band crash if a year has no events
+      var dummyBlank = ee.Image(0).rename(['occurred']).toByte();
+      var hasEvent = yearCollection.merge(ee.ImageCollection([dummyBlank])).max();
+      
+      return hasEvent.rename('anyEvent');
+    })
+  );
+  
+  // Sum up years matching the condition, convert to percentage of total study timeline
+  return annualOccurrence.sum()
+                         .divide(totalYears)
+                         .multiply(100)
+                         .rename('FD' + level + '_freqPct');
+}
+
+// Generate the corrected event-based frequency map layers
+var FD1_freq = freqByLevel_events(1);
+var FD2_freq = freqByLevel_events(2);
+var FD3_freq = freqByLevel_events(3);
+var FD4_freq = freqByLevel_events(4);
+
+// ---- Outputs ----
+// Counts:    FD1_count..FD4_count, nEvents_all
+// Duration:  FD1_dur..FD4_dur
+// Frequency: FD1_freq..FD4_freq
+
+// Export
+var region = POS.geometry();
+var scale  = 500;
+
+// Use MODIS projection (you already have baseProj earlier)
+var proj = baseProj;
+
+function exportOne(img, name){
+  // FORCE: one band + fixed projection
+  var one = ee.Image(img)
+    .select([0])                 // guarantee single band
+    .toFloat()
+    .setDefaultProjection(proj)  // set a default projection
+    .reproject({crs: proj.crs(), scale: scale})  // force consistent projection
+    .clip(POS);
+
+  Export.image.toAsset({
+    image: one,
+    description: name,
+    assetId: 'users/mingxiuw/' + name,
+    region: region,
+    scale: scale,
+    maxPixels: 1e13
+  });
+}
+
+
+
+// ---- COUNTS ----
+// exportOne(FD1_count.unmask(0), 'POS_FD1_count_2000_2024');
+// exportOne(FD2_count.unmask(0), 'POS_FD2_count_2000_2024');
+// exportOne(FD3_count.unmask(0), 'POS_FD3_count_2000_2024');
+// exportOne(FD4_count.unmask(0), 'POS_FD4_count_2000_2024');
+
+// ---- FREQUENCY ----
+// exportOne(FD1_freq.unmask(0),  'POS_FD1_freqPct_2000_2024');
+// exportOne(FD2_freq.unmask(0),  'POS_FD2_freqPct_2000_2024');
+// exportOne(FD3_freq.unmask(0),  'POS_FD3_freqPct_2000_2024');
+// exportOne(FD4_freq.unmask(0),  'POS_FD4_freqPct_2000_2024');
+
+
+// // ---- DURATION (keep masked where no events) ----
+// exportOne(FD1_dur, 'POS_FD1_meanDurDays_2000_2024');
+// exportOne(FD2_dur, 'POS_FD2_meanDurDays_2000_2024');
+// exportOne(FD3_dur, 'POS_FD3_meanDurDays_2000_2024');
+// exportOne(FD4_dur, 'POS_FD4_meanDurDays_2000_2024');
+
+// map of intensity based FD metrics
+// Load exported FD1 count
+var FD1_freq = ee.Image('users/mingxiuw/POS_FD1_freqPct_2000_2024').clip(POS); //0-72
+var FD2_freq = ee.Image('users/mingxiuw/POS_FD2_freqPct_2000_2024').clip(POS); //0-48
+var FD3_freq = ee.Image('users/mingxiuw/POS_FD3_freqPct_2000_2024').clip(POS); //0-28
+var FD4_freq = ee.Image('users/mingxiuw/POS_FD4_freqPct_2000_2024').clip(POS); //0-20
+
+var FD1_count = ee.Image('users/mingxiuw/POS_FD1_count_2000_2024').clip(POS); //0-20
+var FD2_count = ee.Image('users/mingxiuw/POS_FD2_count_2000_2024').clip(POS); //0-15
+var FD3_count = ee.Image('users/mingxiuw/POS_FD3_count_2000_2024').clip(POS); //0-7
+var FD4_count = ee.Image('users/mingxiuw/POS_FD4_count_2000_2024').clip(POS); //0-5
+
+var FD1_dur = ee.Image('users/mingxiuw/POS_FD1_meanDurDays_2000_2024').clip(POS); //32-48
+var FD2_dur = ee.Image('users/mingxiuw/POS_FD2_meanDurDays_2000_2024').clip(POS); //32-56
+var FD3_dur = ee.Image('users/mingxiuw/POS_FD3_meanDurDays_2000_2024').clip(POS); //32-64
+var FD4_dur = ee.Image('users/mingxiuw/POS_FD4_meanDurDays_2000_2024').clip(POS); //32-56
+
+// Quick check: min/max over POS
+// print('FD1 dur min/max', FD1_dur.reduceRegion({
+//   reducer: ee.Reducer.minMax(),
+//   geometry: POS.geometry(),
+//   scale: 500,
+//   maxPixels: 1e13,
+//   tileScale: 4
+// }));
+
+// print('FD2 dur min/max', FD2_dur.reduceRegion({
+//   reducer: ee.Reducer.minMax(),
+//   geometry: POS.geometry(),
+//   scale: 500,
+//   maxPixels: 1e13,
+//   tileScale: 4
+// }));
+
+// print('FD3 dur min/max', FD3_dur.reduceRegion({
+//   reducer: ee.Reducer.minMax(),
+//   geometry: POS.geometry(),
+//   scale: 500,
+//   maxPixels: 1e13,
+//   tileScale: 4
+// }));
+
+// print('FD4 dur min/max', FD4_dur.reduceRegion({
+//   reducer: ee.Reducer.minMax(),
+//   geometry: POS.geometry(),
+//   scale: 500,
+//   maxPixels: 1e13,
+//   tileScale: 4
+// }));
+
+// Display
+// Map.centerObject(POS, 7);
+// Map.addLayer(FD1_count, {min: 0, max: 20, palette: lajolla}, 'FD1 counts');
+// Map.addLayer(FD2_count, {min: 0, max: 15, palette: lajolla}, 'FD2 counts');
+// Map.addLayer(FD3_count, {min: 0, max: 7, palette: lajolla}, 'FD3 counts');
+// Map.addLayer(FD4_count, {min: 0, max: 5, palette: lajolla}, 'FD4 counts');
+
+// Map.addLayer(FD1_freq, {min: 0, max: 72, palette: lajolla}, 'FD1 frequency');
+// Map.addLayer(FD2_freq, {min: 0, max: 48, palette: lajolla}, 'FD2 frequency');
+// Map.addLayer(FD3_freq, {min: 0, max: 28, palette: lajolla}, 'FD3 frequency');
+// Map.addLayer(FD4_freq, {min: 0, max: 20, palette: lajolla}, 'FD4 frequency');
+
+// Map.addLayer(FD1_dur, {min: 32, max: 48, palette: lajolla}, 'FD1 duration');
+// Map.addLayer(FD2_dur, {min: 32, max: 56, palette: lajolla}, 'FD2 duration');
+// Map.addLayer(FD3_dur, {min: 32, max: 64, palette: lajolla}, 'FD3 duration');
+// Map.addLayer(FD4_dur, {min: 32, max: 56, palette: lajolla}, 'FD4 duration');
+
+Map.addLayer(POS.style({color:'000000', width:1.5, fillColor:'00000000'}), {}, 'POS outline');
+
+// addSegmentedLegend('FD1 counts', lajolla, 0, 20, 'bottom-left', 4);
+// addSegmentedLegend('FD2 counts', lajolla, 0, 15, 'bottom-left', 4);
+// addSegmentedLegend('FD3 counts', lajolla, 0, 7, 'bottom-left', 4);
+addSegmentedLegend('FD4 counts', lajolla, 0, 5, 'bottom-left', 4);
+
+// addSegmentedLegend('FD1 frequency (%)', lajolla, 0, 72, 'bottom-right', 4);
+// addSegmentedLegend('FD2 frequency (%)', lajolla, 0, 48, 'bottom-right', 4);
+// addSegmentedLegend('FD3 frequency (%)', lajolla, 0, 28, 'bottom-right', 4);
+addSegmentedLegend('FD4 frequency (%)', lajolla, 0, 20, 'bottom-left', 4);
+
+addSegmentedLegend('FD1 duration (days)', lajolla, 32, 48, 'bottom-right', 4);
+addSegmentedLegend('FD2 duration (days)', lajolla, 32, 56, 'bottom-right', 4);
+addSegmentedLegend('FD3 duration (days)', lajolla, 32, 64, 'bottom-right', 4);
+addSegmentedLegend('FD4 duration (days)', lajolla, 32, 56, 'bottom-left', 4);
+
+// =========================================================================
+// FOOLPROOF EXPORT: ELIMINATES BLACK CORNERS USING A WHITE BACKGROUND IMAGE
+/*
+var img = FD4_count.clip(POS);
+var vis = {min: 0, max: 5, palette: lajolla};
+
+// 2. Convert map values into a standard 3-band RGB image canvas
+var styled = img.visualize(vis);
+
+// 3. Generate the precise 1.5-width black boundary outline
+var outline = POS.style({
+  color: '000000', 
+  width: 1.5,
+  fillColor: '00000000' 
+});
+
+// 4. Blend the map data and the black outline together (keeps line crisp on top)
+var rgbCombined = styled.blend(outline);
+
+// 5. Create a solid, global 3-band white base layer matching GEE's channel names
+var whiteBackground = ee.Image.constant([255, 255, 255])
+  .rename(['vis-red', 'vis-green', 'vis-blue'])
+  .toByte();
+
+// 6. Overlay your map directly on top of the solid white base layer
+// Your map covers the inside; the white background shows through the empty corners
+var finalRgb = whiteBackground.blend(rgbCombined);
+
+// 7. Select the clean 3 channels to guarantee compatibility with PPT/image viewers
+var finalExport = finalRgb.select(['vis-red', 'vis-green', 'vis-blue']);
+
+// 8. Run the export task to your Google Drive
+Export.image.toDrive({
+  image: finalExport,
+  description: 'FD4_count',
+  fileNamePrefix: 'FD4_count',
+  region: POS.geometry().bounds(), // Safe bounding box rectangle
+  scale: 500,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',    
+  maxPixels: 1e13
+});*/
+
+
+// ============================================================
+// STEP 0: Export fdWinWithIntensity as yearly image assets
+// Run ONCE. Each image = one 8-day step with bands:
+//   FDwin3 (0/1) + FD_intensity (0..4)
+/*
+var fdExportYears = [
+  2000,2001,2002,2003,2004,2005,2006,
+  2007,2008,2009,2010,2011,2012,2013,
+  2014,2015,2016,2017,2018,2019,2020,
+  2021,2022,2023,2024
+];
+
+fdExportYears.forEach(function(yr) {
+  var yearStart = ee.Date.fromYMD(yr, 1, 1);
+  var yearEnd   = ee.Date.fromYMD(yr + 1, 1, 1);
+
+  var fdYear = fdWinWithIntensity
+    .filterDate(yearStart, yearEnd)
+    .select(['FDwin3', 'FD_intensity'])
+    .sort('system:time_start');
+
+  var nSteps   = fdYear.size();
+  var stepList = fdYear.toList(nSteps);
+
+  // ── Build the correctly named ImageCollection ──────────────
+  var renamedIC = ee.ImageCollection(
+    ee.List.sequence(0, nSteps.subtract(1)).map(function(i) {
+      i = ee.Number(i);
+      var iStr = i.format('%02d'); // '00', '01', ... '45'
+
+      var img = ee.Image(stepList.get(i)).unmask(0);
+
+      // Rename BEFORE stacking so final band names are legal
+      // e.g. "fw00", "fi00", "fw01", "fi01" ...
+      return img.select(['FDwin3','FD_intensity'])
+                .rename([
+                  ee.String('fw').cat(iStr),   // fw00..fw45  (flash-window)
+                  ee.String('fi').cat(iStr)    // fi00..fi45  (flash-intensity)
+                ]);
+    })
+  );
+
+  // .toBands() now produces "0_fw00", so we rename again to strip prefix
+  var rawStacked  = renamedIC.toBands();               // has "0_fw00", "1_fi00"...
+  var rawNames    = rawStacked.bandNames();
+
+  // Strip everything up to and including the first underscore
+  // e.g.  "0_fw00"  →  "fw00"
+  var cleanNames = rawNames.map(function(n) {
+    n = ee.String(n);
+    // Find position of first '_' and take everything after it
+    var idx = n.index('_');
+    return n.slice(idx.add(1));
+  });
+
+  var stacked = rawStacked.rename(cleanNames).toFloat().clip(POS);
+
+  Export.image.toAsset({
+    image:       stacked,
+    description: 'POS_fdWin_' + yr,
+    assetId:     'users/mingxiuw/POS_fdWin_' + yr,
+    region:      POS.geometry(),
+    scale:       500,
+    maxPixels:   1e13
+  });
+});
+*/
+
+/*
+// INSPECT & DISPLAY: POS_fdWin_2000
+var asset = ee.Image('users/mingxiuw/POS_fdWin_2000');
+
+// -----------------------------------------------------------
+// 1. Print basic metadata — confirm band count & names
+// -----------------------------------------------------------
+print('Band count:', asset.bandNames().size());
+print('Band names:', asset.bandNames());
+
+// -----------------------------------------------------------
+// 2. Visualisation params
+// -----------------------------------------------------------
+var visWin = {min: 0, max: 1,  palette: ['white', 'steelblue']};
+var visInt = {min: 0, max: 4,  palette: ['white', 'yellow', 'orange', 'red', 'darkred']};
+
+// -----------------------------------------------------------
+// 3. Center map on the POS region
+// -----------------------------------------------------------
+Map.centerObject(asset, 6);
+
+// -----------------------------------------------------------
+// 4. Show a few individual time steps to spot-check
+// -----------------------------------------------------------
+Map.addLayer(asset.select('fw00'), visWin, 'FD Window  — step 00 (early Jan)');
+Map.addLayer(asset.select('fi00'), visInt, 'FD Intensity — step 00');
+
+Map.addLayer(asset.select('fw23'), visWin, 'FD Window  — step 23 (mid-year)');
+Map.addLayer(asset.select('fi23'), visInt, 'FD Intensity — step 23');
+
+Map.addLayer(asset.select('fw45'), visWin, 'FD Window  — step 45 (end of year)');
+Map.addLayer(asset.select('fi45'), visInt, 'FD Intensity — step 45');
+
+// -----------------------------------------------------------
+// 5. Count how many 8-day steps had ANY flash drought
+//    across the whole year → useful sanity check
+// -----------------------------------------------------------
+var totalFDdays = asset
+  .select(asset.bandNames().filter(ee.Filter.stringStartsWith('item', 'fw')))
+  .reduce(ee.Reducer.sum());
+
+Map.addLayer(totalFDdays, {min: 0, max: 10, palette: ['white','yellow','red']},
+             'Total FD steps in 2000');
+
+print('FD window sum stats:', totalFDdays.reduceRegion({
+  reducer:   ee.Reducer.minMax(),
+  geometry:  asset.geometry(),
+  scale:     500,
+  maxPixels: 1e13
+}));
+*/
+
+/*
+// Run this separately to create timestamp assets
+var tsYearsList = [
+  2000,2001,2002,2003,2004,2005,2006,
+  2007,2008,2009,2010,2011,2012,2013,
+  2014,2015,2016,2017,2018,2019,2020,
+  2021,2022,2023,2024
+];
+
+tsYearsList.forEach(function(yr) {
+  var yearStart = ee.Date.fromYMD(yr, 1, 1);
+  var yearEnd   = ee.Date.fromYMD(yr + 1, 1, 1);
+
+  var fdYear = fdWinWithIntensity
+    .filterDate(yearStart, yearEnd)
+    .sort('system:time_start');
+
+  var timeFC = ee.FeatureCollection(
+    fdYear.toList(100).map(function(img) {
+      img = ee.Image(img);
+      return ee.Feature(
+        ee.Geometry.Point([0, 0]),
+        { t_millis: img.get('system:time_start') }
+      );
+    })
+  );
+
+  Export.table.toAsset({
+    collection:  timeFC,
+    description: 'POS_timestamps_' + yr,
+    assetId:     'users/mingxiuw/POS_timestamps_' + yr
+  });
+});
+*/
+
+
+// ============================================================
+// JOB 1 — v9: Export FD flags as GeoTIFF per year
+//
+// Instead of slow pixel sampling, export the stacked FD image
+// directly as a multi-band GeoTIFF.
+//
+// Band layout per year (up to 46 steps):
+//   fw00, fi00, fw01, fi01, ... fw45, fi45, LC_class
+//
+// Python reads with rasterio:
+//   - Extracts lon/lat from pixel coordinates
+//   - Reads FD_flag (fw**) and FD_intensity (fi**) per step
+//   - Reads LC_class band
+//   - Groups consecutive FD steps into events
+//   - Joins with Job 2 CSV by (date, LC_class) for metrics
+// ============================================================
+/*
+var posGeom = POS.geometry();
+
+var LC = ee.Image('MODIS/061/MCD12Q1/2020_01_01')
+           .select('LC_Type1')
+           .clip(posGeom)
+           .rename('LC_class')
+           .toFloat()
+           .reproject({crs: 'EPSG:4326', scale: 500});
+
+function exportFDImageForYear(yr) {
+
+  // ── Load pre-built FD stacked asset ──────────────────────
+  var assetImg = ee.Image('users/mingxiuw/POS_fdWin_' + yr)
+                   .unmask(0)
+                   .toFloat();
+
+  var allBands    = assetImg.bandNames();
+  var fwBandNames = allBands.filter(
+    ee.Filter.stringStartsWith('item', 'fw')
+  );
+
+  // ── Ever-FD mask: pixels flagged at least once this year ──
+  var fdMask = assetImg
+    .select(fwBandNames)
+    .reduce(ee.Reducer.sum())
+    .gt(0);                    // 1 = ever-FD, 0 = never-FD
+
+  // ── Stack: all FD bands + LC_class, masked to ever-FD ────
+  var stackImg = assetImg
+    .addBands(LC)
+    .updateMask(fdMask);
+
+  // ── Single image export — GEE's fastest path ─────────────
+  Export.image.toDrive({
+    image:          stackImg,
+    description:    'POS_FD_pixel_' + yr,
+    folder:         'GEE_Exports',
+    fileNamePrefix: 'POS_FD_pixel_' + yr,
+    region:         posGeom,
+    scale:          500,
+    crs:            'EPSG:4326',
+    maxPixels:      1e13,
+    fileFormat:     'GeoTIFF'
+  });
+}
+
+var yearsList = [
+  2000, 2001, 2002, 2003, 2004, 2005, 2006,
+  2007, 2008, 2009, 2010, 2011, 2012, 2013,
+  2014, 2015, 2016, 2017, 2018, 2019, 2020,
+  2021, 2022, 2023, 2024
+];
+
+yearsList.forEach(function(yr) {
+  exportFDImageForYear(yr);
+});
+*/
+
+
+// ============================================================
+// JOB 2b — Export Pixel-Level GPP / AET / WUE per Year
+//
+// Output : One multi-band GeoTIFF per year
+//          POS_Metrics_pixel_{yr}.tif
+//
+// Band naming convention (mirrors Job 1 fw/fi layout):
+//   gpp_00, aet_00, wue_00,   ← 8-day step 0
+//   gpp_01, aet_01, wue_01,   ← 8-day step 1
+//   ...
+//   gpp_45, aet_45, wue_45,   ← up to 46 steps per year
+//   LC_class                  ← LC group band (appended last)
+//
+// Scale : 500 m  (matches Job 1 / MODIS native)
+// CRS   : EPSG:4326
+// 25 tasks total (one per year, 2000–2024)
+// ============================================================
+/*
+var gpp8 = ee.ImageCollection('MODIS/061/MOD17A2HGF')
+  .select('Gpp')
+  .filterDate('2000-01-01', '2024-12-31')
+  .filterBounds(POS)
+  .map(function(img) {
+    return img
+      .multiply(0.0001).multiply(1000)   // scale → gC m⁻²
+      .rename('GPP_gCm2')
+      .copyProperties(img, ['system:time_start', 'system:index']);
+  });
+
+
+var aet8 = et                            // ← your existing ET ImageCollection
+  .select('ET')
+  .filterDate('2000-01-01', '2024-12-31')
+  .filterBounds(POS)
+  .map(function(img) {
+    return img
+      .multiply(0.1)                     // scale → mm
+      .rename('AET_mm')
+      .copyProperties(img, ['system:time_start', 'system:index']);
+  });
+
+
+var timeFilter = ee.Filter.equals({
+  leftField : 'system:time_start',
+  rightField: 'system:time_start'
+});
+
+var gppAetWue = ee.ImageCollection(
+  ee.Join.inner().apply(gpp8, aet8, timeFilter)
+  .map(function(f) {
+    var g   = ee.Image(f.get('primary'));     // GPP
+    var a   = ee.Image(f.get('secondary'));   // AET
+    var wue = g.divide(a)
+               .rename('WUE')
+               .updateMask(a.gt(0));          // avoid divide-by-zero
+
+    return g.addBands(a).addBands(wue)
+            .set('system:time_start', g.get('system:time_start'))
+            .set('system:index',      g.get('system:index'));
+  })
+).sort('system:time_start');
+
+
+var job2Years = [
+  2000, 2001, 2002, 2003, 2004,
+  2005, 2006, 2007, 2008, 2009,
+  2010, 2011, 2012, 2013, 2014,
+  2015, 2016, 2017, 2018, 2019,
+  2020, 2021, 2022, 2023, 2024
+];
+
+job2Years.forEach(function(yr) {
+
+  var yearStart = ee.Date.fromYMD(yr,     1, 1);
+  var yearEnd   = ee.Date.fromYMD(yr + 1, 1, 1);
+
+  // ── Filter to this year's 8-day composites ────────────────
+  var yrCol = gppAetWue.filterDate(yearStart, yearEnd);
+
+  // ── Convert ImageCollection → indexed list ────────────────
+  var imgList  = yrCol.toList(yrCol.size());
+  var nSteps   = yrCol.size();
+
+  // ── Build multi-band stack: gpp_00 aet_00 wue_00 gpp_01 ... ─
+  //    Each step contributes 3 bands, zero-padded index (00–45)
+  var metricStack = ee.Image(
+    ee.List.sequence(0, nSteps.subtract(1))
+      .iterate(function(i, acc) {
+        i   = ee.Number(i).int();
+        acc = ee.Image(acc);
+
+        var img   = ee.Image(imgList.get(i));
+        var pad   = i.format('%02d');          // '00', '01', ..., '45'
+
+        var gppB  = img.select('GPP_gCm2').rename(ee.String('gpp_').cat(pad));
+        var aetB  = img.select('AET_mm')  .rename(ee.String('aet_').cat(pad));
+        var wueB  = img.select('WUE')     .rename(ee.String('wue_').cat(pad));
+
+        return acc.addBands(gppB).addBands(aetB).addBands(wueB);
+      },
+      // ── Seed: first step as base image ─────────────────────
+      ee.Image(ee.List([
+        ee.Image(imgList.get(0)).select('GPP_gCm2').rename('gpp_00'),
+        ee.Image(imgList.get(0)).select('AET_mm')  .rename('aet_00'),
+        ee.Image(imgList.get(0)).select('WUE')     .rename('wue_00')
+      ]).slice(0, 1)
+        .iterate(function(b, a) { return ee.Image(a).addBands(ee.Image(b)); },
+          ee.Image(imgList.get(0)).select('GPP_gCm2').rename('gpp_00'))
+      )
+    )
+  );
+
+  // ── Cleaner approach using sequential band merging ─────────
+  //    (GEE-safe: avoids iterate seed complexity)
+  var bandImages = ee.List.sequence(0, nSteps.subtract(1))
+    .map(function(i) {
+      i       = ee.Number(i).int();
+      var img = ee.Image(imgList.get(i));
+      var pad = i.format('%02d');
+
+      return img
+        .select(['GPP_gCm2', 'AET_mm', 'WUE'])
+        .rename([
+          ee.String('gpp_').cat(pad),
+          ee.String('aet_').cat(pad),
+          ee.String('wue_').cat(pad)
+        ]);
+    });
+
+  // Collapse list of 3-band images → single multi-band image
+  var stackedMetrics = ee.ImageCollection(bandImages).toBands();
+  // ⚠️  toBands() prefixes band names with collection index:
+  //     '0_gpp_00', '1_aet_00' etc.
+  //     This is fine — Job 3 Python will strip the prefix on read.
+
+  // ── Append LC_class band (same as Job 1) ──────────────────
+  var finalStack = stackedMetrics
+    .addBands(lcGroup.rename('LC_class'))
+    .clip(posGeom)
+    .toFloat();                            // uniform dtype
+
+  // ── Export ────────────────────────────────────────────────
+  var desc = 'POS_Metrics_pixel_' + yr;
+
+  Export.image.toDrive({
+    image          : finalStack,
+    description    : desc,
+    folder         : 'GEE_Exports',        // same folder as Job 1
+    fileNamePrefix : desc,
+    region         : posGeom,
+    scale          : 500,                  // 500 m — matches Job 1
+    crs            : 'EPSG:4326',
+    maxPixels      : 1e13,
+    fileFormat     : 'GeoTIFF'
+  });
+
+  // Optional: log to console for verification
+  print('Task queued: ' + desc);
+});
+*/
+
+/*
+// =========================================================================
+// 1. LAND COVER VISUALIZATION for study region map!
+
+// Define professional cartographic colors for your 4 target groups
+// 1: Forests (Dark Green), 2: Savanna/Shrub (Olive), 3: Grasslands (Light Yellow/Gold), 4: Croplands (Orange)
+// var lcPalette = ['#1a5235', '#74a05a', '#fcd163', '#e07616'];
+var lcPalette = ['#1a5235', '#e07616', '#74a05a', '#fcd163'];
+var lcNames   = ['Forests', 'Savanna & Shrublands', 'Grasslands', 'Croplands'];
+
+// palette = {'Forests': '#1c8c67', 'Savanna & Shrublands': '#966503',
+          // 'Grasslands': '#1bad02', 'Croplands': '#fab341', 'All': '#000000'}
+
+var lcVis = {
+  min: 1,
+  max: 4,
+  palette: lcPalette
+};
+
+// Ensure your study area bounding geometry is active
+var posGeom = POS.geometry();
+
+// Clip your grouped land cover layer to your study region boundaries
+var lcDisplay = lcGroup.clip(posGeom);
+
+// 2. RENDER MAP LAYERS TO CANVAS
+
+// Center map view over your study region
+Map.centerObject(POS, 5);
+
+// Add your custom 4-group land cover layer to the map interface
+Map.addLayer(lcDisplay, lcVis, 'Grouped Land Cover (1:Forest, 2:Sav, 3:Grass, 4:Crop)');
+
+// Optional: Overlay the administrative outline boundary of your study area for spatial reference
+var borderStyle = {color: '#000000', fillColor: '#00000000', width: 2};
+Map.addLayer(POS.style(borderStyle), {}, 'Study Area Boundary (POS)');
+
+// 3. GENERATE AUTOMATED CONSOLE LEGEND
+
+// Instantiate the container dashboard element for the color legend keys
+var legendPanel = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px',
+    backgroundColor: 'rgba(255, 255, 255, 0.85)'
+  }
+});
+
+// Create and append the descriptive Title label header string
+var legendTitle = ui.Label({
+  value: 'Land Cover types',
+  style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 6px 0'}
+});
+legendPanel.add(legendTitle);
+
+// Loop through each group metadata entry to render corresponding colored swatch markers
+for (var i = 0; i < 4; i++) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: lcPalette[i],
+      padding: '8px',
+      margin: '0 6px 4px 0',
+      border: '0.5px solid #666'
+    }
+  });
+  
+  var descriptionText = ui.Label({
+    value: lcNames[i],
+    style: {margin: '2px 0 4px 0', fontSize: '12px'}
+  });
+  
+  // Arrange elements into row sub-panels and inject into root legend context
+  var entryRow = ui.Panel({
+    widgets: [colorBox, descriptionText],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+  legendPanel.add(entryRow);
+}
+
+// Attach the fully populated visual legend onto the map viewport layout interface
+Map.add(legendPanel);
+
+
+// EXPORT GROUPED LAND COVER MAP WITH BOUNDARY
+
+// 1. Define your 4 target land cover colors (RGB Palette)
+var lcVis = {
+  min: 1,
+  max: 4,
+  palette: lcPalette
+};
+
+// 2. Crop your grouped land cover layer to your study region boundaries
+var lcImg = lcGroup.clip(POS);
+
+// 3. Convert data to RGB and unmask it to a solid white background (255)
+// This removes the alpha channel that breaks desktop image viewers and PPT
+var lcStyled = lcImg.visualize(lcVis).unmask(255); 
+
+// 4. Generate the precise black administrative outline
+var lcOutline = POS.style({
+  color: '000000',  
+  width: 1.5,
+  fillColor: '00000000' // Transparent fill syntax
+});
+
+// 5. Blend the land cover map and the black vector boundary outline together
+var lcRgbCombined = lcStyled.blend(lcOutline);
+
+// 6. Force GEE to select only the 3 explicit channels (Red, Green, Blue)
+var lcFinalExport = lcRgbCombined.select(['vis-red', 'vis-green', 'vis-blue']);
+
+// 7. Execute the Task Export to Drive
+Export.image.toDrive({
+  image: lcFinalExport,
+  description: 'Grouped_LandCover_Map',
+  fileNamePrefix: 'Grouped_LandCover_Map',
+  region: POS.geometry().bounds(), // Use bounds to prevent raster clipping errors
+  scale: 500,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',    
+  maxPixels: 1e13
+});
+*/
+/*
+// ============================================================================
+// STRICT CALENDAR-MONTH WEIGHTED MODIS AET + GPP
+// POS regional monthly mean CSV
+//
+// MOD16A2GF ET:
+//   stored value × 0.1 = mm per composite
+//
+// MOD17A2HGF Gpp:
+//   stored value × 0.0001 kg C m-2
+//                × 1000 = g C m-2 per composite
+//
+// IMPORTANT:
+// Each MODIS composite is apportioned across calendar months according
+// to the fraction of composite days falling within each month.
+//
+// Example:
+// 8-day composite = 3 days in May + 5 days in June
+// May receives 3/8 of the composite total
+// June receives 5/8 of the composite total
+// ============================================================================
+
+
+// ---------------------------------------------------------------------------
+// 1. STUDY AREA
+// ---------------------------------------------------------------------------
+
+var POS = ee.FeatureCollection(
+  "projects/top-script-319218/assets/POS"
+);
+
+var posGeom = POS.geometry();
+
+
+// ---------------------------------------------------------------------------
+// 2. TARGET PERIOD
+// ---------------------------------------------------------------------------
+
+var analysisStart = ee.Date('2000-01-01');
+var analysisEnd   = ee.Date('2025-01-01');   // exclusive
+
+// Load slightly beyond 2024 so that the start date of the first 2025
+// composite can be used to determine the actual duration of the
+// last 2024 composite.
+var dataEnd = ee.Date('2025-01-10');
+
+
+// ---------------------------------------------------------------------------
+// 3. LOAD AND SCALE MOD16 AET
+// ---------------------------------------------------------------------------
+
+var aetRaw = ee.ImageCollection('MODIS/061/MOD16A2GF')
+  .filterDate(analysisStart, dataEnd)
+  .filterBounds(POS)
+  .select('ET')
+  .sort('system:time_start')
+  .map(function(img) {
+
+    return img
+      .multiply(0.1)
+      .toFloat()                 // <-- ADD THIS
+      .rename('AET_mm')
+      .copyProperties(img, ['system:time_start']);
+  });
+
+
+// ---------------------------------------------------------------------------
+// 4. LOAD AND SCALE MOD17 GPP
+// ---------------------------------------------------------------------------
+
+var gppRaw = ee.ImageCollection('MODIS/061/MOD17A2HGF')
+  .filterDate(analysisStart, dataEnd)
+  .filterBounds(POS)
+  .select('Gpp')
+  .sort('system:time_start')
+  .map(function(img) {
+
+    return img
+      .multiply(0.0001)
+      .multiply(1000)
+      .toFloat()                 // <-- ADD THIS
+      .rename('GPP_gC_m2')
+      .copyProperties(img, ['system:time_start']);
+  });
+
+// ---------------------------------------------------------------------------
+// 5. ATTACH AN END DATE TO EVERY COMPOSITE
+//
+// Normally:
+//     composite end = start + 8 days
+//
+// At the end of the year:
+//     next MODIS start date may occur before start + 8 days
+//     (e.g., a 5- or 6-day final composite)
+//
+// We therefore use:
+//
+//     min(next composite start, start + 8 days)
+//
+// ---------------------------------------------------------------------------
+
+function addCompositeEnd(ic) {
+
+  var sorted = ic.sort('system:time_start');
+
+  var n = sorted.size();
+
+  var imgList = sorted.toList(n);
+
+  var withEnd = ee.ImageCollection.fromImages(
+
+    ee.List.sequence(0, n.subtract(2)).map(function(i) {
+
+      i = ee.Number(i);
+
+      var current = ee.Image(imgList.get(i));
+
+      var next = ee.Image(
+        imgList.get(i.add(1))
+      );
+
+      var start = ee.Date(
+        current.get('system:time_start')
+      );
+
+      var nextStart = ee.Date(
+        next.get('system:time_start')
+      );
+
+      var nominalEnd = start.advance(8, 'day');
+
+      var actualEndMillis = ee.Number(
+        nextStart.millis()
+      ).min(
+        nominalEnd.millis()
+      );
+
+      return current.set({
+        'comp_start': start.millis(),
+        'comp_end': actualEndMillis
+      });
+
+    })
+  );
+
+  return withEnd;
+}
+
+
+var aet8d = addCompositeEnd(aetRaw)
+  .filterDate(analysisStart, analysisEnd);
+
+var gpp8d = addCompositeEnd(gppRaw)
+  .filterDate(analysisStart, analysisEnd);
+
+
+print(
+  'MOD16 composites used:',
+  aet8d.size()
+);
+
+print(
+  'MOD17 composites used:',
+  gpp8d.size()
+);
+
+
+// ---------------------------------------------------------------------------
+// 6. FUNCTION:
+// SPLIT COMPOSITES ACROSS CALENDAR MONTH BOUNDARIES
+// ---------------------------------------------------------------------------
+
+function calendarMonthTotal(
+  ic,
+  bandName,
+  monthStart,
+  monthEnd
+) {
+
+  // Find every composite that overlaps the current month.
+
+  var overlapIC = ic
+
+    .filter(
+      ee.Filter.lt(
+        'system:time_start',
+        monthEnd.millis()
+      )
+    )
+
+    .filter(
+      ee.Filter.gt(
+        'comp_end',
+        monthStart.millis()
+      )
+    );
+
+
+  // Apportion each composite according to overlap duration.
+
+  var weighted = overlapIC.map(function(img) {
+
+    var compStart = ee.Date(
+      img.get('system:time_start')
+    );
+
+    var compEnd = ee.Date(
+      img.get('comp_end')
+    );
+
+
+    // Beginning of temporal overlap
+
+    var overlapStart = ee.Date(
+
+      ee.Number(
+        compStart.millis()
+      ).max(
+        monthStart.millis()
+      )
+
+    );
+
+
+    // End of temporal overlap
+
+    var overlapEnd = ee.Date(
+
+      ee.Number(
+        compEnd.millis()
+      ).min(
+        monthEnd.millis()
+      )
+
+    );
+
+
+    // Number of days belonging to this calendar month
+
+    var overlapDays = overlapEnd
+      .difference(
+        overlapStart,
+        'day'
+      )
+      .max(0);
+
+
+    // Actual duration of this MODIS composite
+
+    var compositeDays = compEnd
+      .difference(
+        compStart,
+        'day'
+      );
+
+
+    // Fraction assigned to this month
+
+    var fraction = overlapDays
+      .divide(compositeDays);
+
+
+    return img
+      .select(bandName)
+      .multiply(fraction)
+      .toFloat()                    // <-- ADD THIS
+      .rename(bandName);
+
+  });
+
+
+  // If no observations exist, return a fully masked image
+  // rather than incorrectly assigning zero.
+
+  var monthlyImage = ee.Image(
+
+    ee.Algorithms.If(
+
+      overlapIC.size().gt(0),
+
+      weighted.sum()
+        .rename(bandName),
+
+      ee.Image.constant(0)
+        .toFloat()
+        .rename(bandName)
+        .updateMask(
+          ee.Image.constant(0)
+        )
+
+    )
+  );
+
+
+  return monthlyImage;
+}
+
+
+// ---------------------------------------------------------------------------
+// 7. CREATE MONTH LIST
+// ---------------------------------------------------------------------------
+
+var numberMonths = analysisEnd
+  .difference(
+    analysisStart,
+    'month'
+  );
+
+var monthIndices = ee.List.sequence(
+  0,
+  numberMonths.subtract(1)
+);
+
+
+// ---------------------------------------------------------------------------
+// 8. CALCULATE MONTHLY TOTALS + POS SPATIAL MEANS
+// ---------------------------------------------------------------------------
+
+var monthlyTable = ee.FeatureCollection(
+
+  monthIndices.map(function(m) {
+
+    m = ee.Number(m);
+
+
+    var monthStart = analysisStart
+      .advance(
+        m,
+        'month'
+      );
+
+    var monthEnd = monthStart
+      .advance(
+        1,
+        'month'
+      );
+
+
+    // --------------------------------------------------------
+    // Calendar-month AET
+    // --------------------------------------------------------
+
+    var aetMonth = calendarMonthTotal(
+      aet8d,
+      'AET_mm',
+      monthStart,
+      monthEnd
+    ).rename(
+      'AET_mm_month'
+    );
+
+
+    // --------------------------------------------------------
+    // Calendar-month GPP
+    // --------------------------------------------------------
+
+    var gppMonth = calendarMonthTotal(
+      gpp8d,
+      'GPP_gC_m2',
+      monthStart,
+      monthEnd
+    ).rename(
+      'GPP_gC_m2_month'
+    );
+
+
+    // --------------------------------------------------------
+    // POS regional spatial mean
+    // --------------------------------------------------------
+
+    var aetMean = aetMonth.reduceRegion({
+
+      reducer: ee.Reducer.mean(),
+
+      geometry: posGeom,
+
+      scale: 500,
+
+      maxPixels: 1e13,
+
+      tileScale: 4
+
+    }).get(
+      'AET_mm_month'
+    );
+
+
+    var gppMean = gppMonth.reduceRegion({
+
+      reducer: ee.Reducer.mean(),
+
+      geometry: posGeom,
+
+      scale: 500,
+
+      maxPixels: 1e13,
+
+      tileScale: 4
+
+    }).get(
+      'GPP_gC_m2_month'
+    );
+
+
+    // --------------------------------------------------------
+    // Useful QC: number of overlapping composites
+    // --------------------------------------------------------
+
+    var aetN = aet8d
+
+      .filter(
+        ee.Filter.lt(
+          'system:time_start',
+          monthEnd.millis()
+        )
+      )
+
+      .filter(
+        ee.Filter.gt(
+          'comp_end',
+          monthStart.millis()
+        )
+      )
+
+      .size();
+
+
+    var gppN = gpp8d
+
+      .filter(
+        ee.Filter.lt(
+          'system:time_start',
+          monthEnd.millis()
+        )
+      )
+
+      .filter(
+        ee.Filter.gt(
+          'comp_end',
+          monthStart.millis()
+        )
+      )
+
+      .size();
+
+
+    return ee.Feature(
+      null,
+      {
+
+        date:
+          monthStart.format(
+            'YYYY-MM'
+          ),
+
+        year:
+          monthStart.get(
+            'year'
+          ),
+
+        month:
+          monthStart.get(
+            'month'
+          ),
+
+        AET_mm_month:
+          aetMean,
+
+        GPP_gC_m2_month:
+          gppMean,
+
+        AET_n_composites:
+          aetN,
+
+        GPP_n_composites:
+          gppN
+
+      }
+    );
+
+  })
+);
+
+
+// ---------------------------------------------------------------------------
+// 9. INSPECT RESULTS
+// ---------------------------------------------------------------------------
+
+print(
+  'Monthly calendar-weighted MODIS AET + GPP',
+  monthlyTable.limit(24)
+);
+
+print(
+  'Number of monthly records',
+  monthlyTable.size()
+);
+
+
+// ---------------------------------------------------------------------------
+// 10. EXPORT CSV
+// ---------------------------------------------------------------------------
+
+Export.table.toDrive({
+
+  collection:
+    monthlyTable,
+
+  description:
+    'POS_MODIS_calendar_month_weighted_AET_GPP_2000_2024',
+
+  fileNamePrefix:
+    'POS_MODIS_calendar_month_weighted_AET_GPP_2000_2024',
+
+  fileFormat:
+    'CSV',
+
+  selectors: [
+
+    'date',
+
+    'year',
+
+    'month',
+
+    'AET_mm_month',
+
+    'GPP_gC_m2_month',
+
+    'AET_n_composites',
+
+    'GPP_n_composites'
+
+  ]
+
+});*/
+/*
+// ============================================================================
+// LAND-COVER STABILITY ANALYSIS
+// MCD12Q1 Version 6.1, IGBP LC_Type1
+// Study area: Post Oak Savanna (POS)
+// Period: 2001–2024
+// Reference land-cover map: 2020
+//
+// Four grouped classes:
+// 1 = Forests             (IGBP 1–5)
+// 2 = Savannas/Shrublands (IGBP 6–9)
+// 3 = Grasslands          (IGBP 10)
+// 4 = Croplands           (IGBP 12, 14)
+// ============================================================================
+
+
+// ---------------------------------------------------------------------------
+// 1. STUDY AREA
+// ---------------------------------------------------------------------------
+
+var POS = ee.FeatureCollection(
+  "projects/top-script-319218/assets/POS"
+);
+
+var posGeom = POS.geometry();
+
+
+// ---------------------------------------------------------------------------
+// 2. YEARS
+// ---------------------------------------------------------------------------
+
+var startYear = 2001;
+var endYear   = 2024;
+
+var years = ee.List.sequence(startYear, endYear);
+
+var nYears = endYear - startYear + 1;
+
+
+// ---------------------------------------------------------------------------
+// 3. IGBP -> FOUR LAND-COVER GROUPS
+// ---------------------------------------------------------------------------
+
+var lcWanted = [
+  1, 2, 3, 4, 5,       // forests
+  6, 7, 8, 9,          // shrublands / savannas
+  10,                   // grasslands
+  12, 14                // croplands
+];
+
+var lcGroups = [
+  1, 1, 1, 1, 1,
+  2, 2, 2, 2,
+  3,
+  4, 4
+];
+
+
+function groupLandCover(img) {
+
+  // Explicitly cast input to ee.Image
+  img = ee.Image(img);
+
+  var grouped = img
+    .select('LC_Type1')
+    .remap(
+      lcWanted,
+      lcGroups,
+      0                  // all other classes -> 0
+    )
+    .rename('class')
+    .toByte();
+
+  return grouped
+    .copyProperties(img, ['system:time_start']);
+}
+
+
+// ---------------------------------------------------------------------------
+// 4. BUILD ANNUAL GROUPED LAND-COVER COLLECTION
+// ---------------------------------------------------------------------------
+
+var lcAnnual = ee.ImageCollection.fromImages(
+
+  years.map(function(y) {
+
+    y = ee.Number(y);
+
+    var img = ee.ImageCollection('MODIS/061/MCD12Q1')
+      .filter(
+        ee.Filter.calendarRange(
+          y,
+          y,
+          'year'
+        )
+      )
+      .first();
+
+    var grouped = ee.Image(groupLandCover(img))
+      .clip(POS)
+      .set('year', y);
+
+    return grouped;
+  })
+
+);
+
+print(
+  'Annual grouped land cover',
+  lcAnnual
+);
+
+
+// ============================================================================
+// PART A.
+// ANNUAL AREA AND PERCENTAGE OF EACH LAND-COVER CLASS
+// ============================================================================
+
+
+// ---------------------------------------------------------------------------
+// 5. TOTAL POS AREA
+// ---------------------------------------------------------------------------
+
+var pixelArea = ee.Image.pixelArea();
+
+var totalPOSArea_m2 = ee.Number(
+
+  pixelArea.reduceRegion({
+
+    reducer: ee.Reducer.sum(),
+
+    geometry: posGeom,
+
+    scale: 500,
+
+    maxPixels: 1e13,
+
+    tileScale: 4
+
+  }).get('area')
+
+);
+
+print(
+  'Total POS area (km2)',
+  totalPOSArea_m2.divide(1e6)
+);
+
+
+// ---------------------------------------------------------------------------
+// 6. ANNUAL CLASS AREA
+// ---------------------------------------------------------------------------
+
+var annualAreaTable = ee.FeatureCollection(
+
+  years.map(function(y) {
+
+    y = ee.Number(y);
+
+    var lc = ee.Image(
+      lcAnnual.filter(
+        ee.Filter.eq(
+          'year',
+          y
+        )
+      ).first()
+    );
+
+
+    function classArea(classID) {
+
+      var area = pixelArea
+        .updateMask(
+          lc.eq(classID)
+        )
+        .reduceRegion({
+
+          reducer: ee.Reducer.sum(),
+
+          geometry: posGeom,
+
+          scale: 500,
+
+          maxPixels: 1e13,
+
+          tileScale: 4
+
+        })
+        .get('area');
+
+      return ee.Number(area);
+    }
+
+
+    var forestArea = classArea(1);
+
+    var savShrubArea = classArea(2);
+
+    var grassArea = classArea(3);
+
+    var cropArea = classArea(4);
+
+
+    return ee.Feature(
+      null,
+      {
+
+        year: y,
+
+        forest_km2:
+          forestArea.divide(1e6),
+
+        forest_pct_POS:
+          forestArea
+            .divide(totalPOSArea_m2)
+            .multiply(100),
+
+
+        savanna_shrub_km2:
+          savShrubArea.divide(1e6),
+
+        savanna_shrub_pct_POS:
+          savShrubArea
+            .divide(totalPOSArea_m2)
+            .multiply(100),
+
+
+        grassland_km2:
+          grassArea.divide(1e6),
+
+        grassland_pct_POS:
+          grassArea
+            .divide(totalPOSArea_m2)
+            .multiply(100),
+
+
+        cropland_km2:
+          cropArea.divide(1e6),
+
+        cropland_pct_POS:
+          cropArea
+            .divide(totalPOSArea_m2)
+            .multiply(100)
+
+      }
+    );
+
+  })
+
+);
+
+
+print(
+  'Annual land-cover area and percentage',
+  annualAreaTable
+);
+
+
+// ---------------------------------------------------------------------------
+// 7. EXPORT ANNUAL AREA TABLE
+// ---------------------------------------------------------------------------
+
+Export.table.toDrive({
+
+  collection:
+    annualAreaTable,
+
+  description:
+    'POS_MCD12Q1_annual_landcover_2001_2024',
+
+  fileNamePrefix:
+    'POS_MCD12Q1_annual_landcover_2001_2024',
+
+  fileFormat:
+    'CSV'
+
+});
+
+
+// ============================================================================
+// PART B.
+// YEAR-BY-YEAR AGREEMENT WITH THE 2020 REFERENCE MAP
+// ============================================================================
+
+
+// ---------------------------------------------------------------------------
+// 8. 2020 REFERENCE MAP
+// ---------------------------------------------------------------------------
+
+var lc2020 = ee.Image(
+  lcAnnual.filter(
+    ee.Filter.eq(
+      'year',
+      2020
+    )
+  ).first()
+);
+
+
+// Only evaluate pixels belonging to one of our four classes in 2020.
+
+var refMask = lc2020.gt(0);
+
+
+// ---------------------------------------------------------------------------
+// 9. ANNUAL AGREEMENT WITH 2020
+// ---------------------------------------------------------------------------
+
+var annualAgreementTable = ee.FeatureCollection(
+
+  years.map(function(y) {
+
+    y = ee.Number(y);
+
+    var lcYear = ee.Image(
+      lcAnnual.filter(
+        ee.Filter.eq(
+          'year',
+          y
+        )
+      ).first()
+    );
+
+
+    // 1 = same grouped class as 2020
+    // 0 = different class
+
+    var same = lcYear
+      .eq(lc2020)
+      .updateMask(refMask)
+      .rename('same');
+
+
+    var agreementPct = ee.Number(
+
+      same.reduceRegion({
+
+        reducer: ee.Reducer.mean(),
+
+        geometry: posGeom,
+
+        scale: 500,
+
+        maxPixels: 1e13,
+
+        tileScale: 4
+
+      }).get('same')
+
+    ).multiply(100);
+
+
+    return ee.Feature(
+      null,
+      {
+
+        year: y,
+
+        agreement_with_2020_pct:
+          agreementPct
+
+      }
+    );
+
+  })
+
+);
+
+
+print(
+  'Annual agreement with 2020 (%)',
+  annualAgreementTable
+);
+
+
+Export.table.toDrive({
+
+  collection:
+    annualAgreementTable,
+
+  description:
+    'POS_MCD12Q1_annual_agreement_with_2020',
+
+  fileNamePrefix:
+    'POS_MCD12Q1_annual_agreement_with_2020',
+
+  fileFormat:
+    'CSV'
+
+});
+
+
+// ============================================================================
+// PART C.
+// PIXEL-LEVEL LONG-TERM STABILITY
+// ============================================================================
+
+
+// ---------------------------------------------------------------------------
+// 10. FOR EACH YEAR:
+//     1 if pixel has same grouped class as 2020
+//     0 otherwise
+// ---------------------------------------------------------------------------
+
+var sameAs2020IC = ee.ImageCollection.fromImages(
+
+  years.map(function(y) {
+
+    y = ee.Number(y);
+
+    var lcYear = ee.Image(
+      lcAnnual.filter(
+        ee.Filter.eq(
+          'year',
+          y
+        )
+      ).first()
+    );
+
+
+    return lcYear
+      .eq(lc2020)
+      .updateMask(refMask)
+      .rename('same')
+      .toByte()
+      .set('year', y);
+
+  })
+
+);
+
+
+// ---------------------------------------------------------------------------
+// 11. NUMBER OF YEARS EACH PIXEL RETAINED ITS 2020 CLASS
+// ---------------------------------------------------------------------------
+
+var sameYearCount = sameAs2020IC
+  .sum()
+  .rename('years_same_as_2020');
+
+
+// ---------------------------------------------------------------------------
+// 12. STABILITY FRACTION (% OF YEARS)
+// ---------------------------------------------------------------------------
+
+var stabilityPct = sameYearCount
+  .divide(nYears)
+  .multiply(100)
+  .rename('stability_pct')
+  .updateMask(refMask);
+
+
+// ---------------------------------------------------------------------------
+// 13. PIXELS STABLE IN ALL YEARS
+//
+// 1 = pixel remained in its 2020 grouped class during all 24 years
+// 0 = changed at least once
+// ---------------------------------------------------------------------------
+
+var alwaysStable = sameYearCount
+  .eq(nYears)
+  .rename('always_stable')
+  .updateMask(refMask);
+
+
+// ---------------------------------------------------------------------------
+// 14. OVERALL REGIONAL STABILITY
+// ---------------------------------------------------------------------------
+
+var overallMeanStability = ee.Number(
+
+  stabilityPct.reduceRegion({
+
+    reducer: ee.Reducer.mean(),
+
+    geometry: posGeom,
+
+    scale: 500,
+
+    maxPixels: 1e13,
+
+    tileScale: 4
+
+  }).get('stability_pct')
+
+);
+
+
+var overallAlwaysStablePct = ee.Number(
+
+  alwaysStable.reduceRegion({
+
+    reducer: ee.Reducer.mean(),
+
+    geometry: posGeom,
+
+    scale: 500,
+
+    maxPixels: 1e13,
+
+    tileScale: 4
+
+  }).get('always_stable')
+
+).multiply(100);
+
+
+print(
+  'Mean temporal stability across reference pixels (%)',
+  overallMeanStability
+);
+
+print(
+  'Pixels remaining in the same grouped class for ALL years (%)',
+  overallAlwaysStablePct
+);
+
+
+// ============================================================================
+// PART D.
+// STABILITY BY 2020 LAND-COVER CLASS
+// ============================================================================
+
+var classIDs = ee.List([
+  1,
+  2,
+  3,
+  4
+]);
+
+
+var classNames = ee.Dictionary({
+
+  '1': 'Forests',
+
+  '2': 'Savannas_Shrublands',
+
+  '3': 'Grasslands',
+
+  '4': 'Croplands'
+
+});
+
+
+var stabilityByClass = ee.FeatureCollection(
+
+  classIDs.map(function(c) {
+
+    c = ee.Number(c);
+
+    var classMask = lc2020.eq(c);
+
+
+    // Mean % of years in which pixels retained the 2020 class
+
+    var meanStability = ee.Number(
+
+      stabilityPct
+        .updateMask(classMask)
+        .reduceRegion({
+
+          reducer:
+            ee.Reducer.mean(),
+
+          geometry:
+            posGeom,
+
+          scale:
+            500,
+
+          maxPixels:
+            1e13,
+
+          tileScale:
+            4
+
+        })
+        .get('stability_pct')
+
+    );
+
+
+    // % of pixels that never changed class
+
+    var alwaysStableClass = ee.Number(
+
+      alwaysStable
+        .updateMask(classMask)
+        .reduceRegion({
+
+          reducer:
+            ee.Reducer.mean(),
+
+          geometry:
+            posGeom,
+
+          scale:
+            500,
+
+          maxPixels:
+            1e13,
+
+          tileScale:
+            4
+
+        })
+        .get('always_stable')
+
+    ).multiply(100);
+
+
+    return ee.Feature(
+      null,
+      {
+
+        class_id:
+          c,
+
+        class_name:
+          classNames.get(
+            c.format()
+          ),
+
+        mean_temporal_stability_pct:
+          meanStability,
+
+        pixels_stable_all_years_pct:
+          alwaysStableClass
+
+      }
+    );
+
+  })
+
+);
+
+
+print(
+  'Land-cover stability by 2020 class',
+  stabilityByClass
+);
+
+
+Export.table.toDrive({
+
+  collection:
+    stabilityByClass,
+
+  description:
+    'POS_MCD12Q1_stability_by_2020_class',
+
+  fileNamePrefix:
+    'POS_MCD12Q1_stability_by_2020_class',
+
+  fileFormat:
+    'CSV'
+
+});
+
+
+// ============================================================================
+// 15. OPTIONAL MAP DISPLAY
+// ============================================================================
+
+Map.centerObject(
+  POS,
+  7
+);
+
+
+Map.addLayer(
+
+  stabilityPct,
+
+  {
+    min: 50,
+    max: 100,
+    palette: [
+      '#d73027',
+      '#fee08b',
+      '#d9ef8b',
+      '#1a9850'
+    ]
+  },
+
+  'Land-cover stability (% years same as 2020)'
+
+);
+
+
+Map.addLayer(
+
+  POS.style({
+
+    color:
+      '000000',
+
+    width:
+      1.5,
+
+    fillColor:
+      '00000000'
+
+  }),
+
+  {},
+
+  'POS outline'
+
+);*/
+
+// ============================================================
+// TABLE 2 — Annual land-cover means for significance testing
+// Output: 25 years × 4 land-cover classes = 100 rows
+// Variables: PET, AET, ESR, GPP, WUE
+// ============================================================
+
+// Study years
+var table2Years = ee.List.sequence(2000, 2024);
+
+// Land-cover classes already defined in your script:
+// lcGroup:
+// 1 = Forests
+// 2 = Savannas/Shrublands
+// 3 = Grasslands
+// 4 = Croplands
+
+var table2Classes = ee.List([1, 2, 3, 4]);
+
+var table2ClassNames = ee.Dictionary({
+  1: 'Forests',
+  2: 'Savanna_Shrublands',
+  3: 'Grasslands',
+  4: 'Croplands'
+});
+
+var posGeom = POS.geometry();
+
+
+// ------------------------------------------------------------
+// Build one feature for each year × land-cover class
+// ------------------------------------------------------------
+
+var annualLandcoverTable = ee.FeatureCollection(
+  table2Years.map(function(y) {
+
+    y = ee.Number(y);
+
+    // Retrieve annual images for this year
+    var petImg = ee.Image(
+      annualPET.filter(ee.Filter.eq('year', y)).first()
+    )
+    .select('PET_sum_mm_yr')
+    .rename('PET');
+
+    var aetImg = ee.Image(
+      annualET.filter(ee.Filter.eq('year', y)).first()
+    )
+    .select('AET_sum_mm_yr')
+    .rename('AET');
+
+    var esrImg = ee.Image(
+      annualESR.filter(ee.Filter.eq('year', y)).first()
+    )
+    .select('ESR_yr')
+    .rename('ESR');
+
+    var annualGPPimg = ee.Image(
+      annualGPP.filter(ee.Filter.eq('year', y)).first()
+    );
+
+    var gppImg = annualGPPimg
+      .select('GPP_sum_yr')
+      .rename('GPP');
+
+    var wueImg = annualGPPimg
+      .select('WUE_yr')
+      .rename('WUE');
+
+
+    // Combine all 5 annual variables
+    var annualEco = petImg
+      .addBands(aetImg)
+      .addBands(esrImg)
+      .addBands(gppImg)
+      .addBands(wueImg);
+
+
+    // Calculate mean for each land-cover class
+    var yearFeatures = table2Classes.map(function(c) {
+
+      c = ee.Number(c);
+
+      var masked = annualEco.updateMask(
+        lcGroup.eq(c)
+      );
+
+      var stats = masked.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: posGeom,
+        scale: 500,
+        maxPixels: 1e13,
+        tileScale: 16
+      });
+
+      return ee.Feature(null, {
+        'Year': y,
+        'class_id': c,
+        'Landcover': table2ClassNames.get(c),
+
+        'PET_mm_yr': stats.get('PET'),
+        'AET_mm_yr': stats.get('AET'),
+        'ESR': stats.get('ESR'),
+        'GPP_gC_m2_yr': stats.get('GPP'),
+        'WUE_gC_kgH2O': stats.get('WUE')
+      });
+
+    });
+
+    return ee.FeatureCollection(yearFeatures);
+
+  })
+).flatten();
+
+
+// ------------------------------------------------------------
+// Check output in Console
+// ------------------------------------------------------------
+
+print(
+  'Annual Table 2 metrics by land-cover class',
+  annualLandcoverTable
+);
+
+print(
+  'Number of rows — should be 100',
+  annualLandcoverTable.size()
+);
+
+
+// ------------------------------------------------------------
+// Export CSV to Google Drive
+// ------------------------------------------------------------
+
+Export.table.toDrive({
+  collection: annualLandcoverTable,
+  description: 'Table2_Annual_Landcover_Metrics_2000_2024',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'Table2_Annual_Landcover_Metrics_2000_2024',
+  fileFormat: 'CSV',
+  selectors: [
+    'Year',
+    'class_id',
+    'Landcover',
+    'PET_mm_yr',
+    'AET_mm_yr',
+    'ESR',
+    'GPP_gC_m2_yr',
+    'WUE_gC_kgH2O'
+  ]
+});
